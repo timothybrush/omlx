@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import signal
 import subprocess
@@ -39,6 +38,7 @@ from ..utils.release_check import normalize_update_channel, select_latest_releas
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
@@ -1490,7 +1490,7 @@ async def create_sub_key(
         raise HTTPException(status_code=400, detail=error_msg)
 
     # Check for duplicate (against main key and existing sub keys)
-    if global_settings.auth.api_key and secrets.compare_digest(
+    if global_settings.auth.api_key and compare_keys(
         request.key, global_settings.auth.api_key
     ):
         raise HTTPException(
@@ -1498,7 +1498,7 @@ async def create_sub_key(
         )
 
     for sk in global_settings.auth.sub_keys:
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             raise HTTPException(status_code=400, detail="This key already exists")
 
     entry = SubKeyEntry(
@@ -1540,7 +1540,7 @@ async def delete_sub_key(
 
     # Find and remove the key
     for i, sk in enumerate(global_settings.auth.sub_keys):
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
                 global_settings.save()
@@ -4115,12 +4115,14 @@ def _build_active_models_data() -> dict:
         active_requests = 0
         waiting_requests = 0
         running_by_id = {}
+        has_scheduler_snapshot = False
         waiting_ids = set()
         waiting = []
         activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        collector_request_ids: set = set()
         active_request_ids: set = set()
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
@@ -4130,18 +4132,17 @@ def _build_active_models_data() -> dict:
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
                     try:
-                        active_request_ids = set(collectors.keys())
-                        active_requests = len(collectors)
+                        collector_request_ids = set(collectors.keys())
                     except RuntimeError:
                         # Scheduler state is mutated from the engine executor;
                         # keep the dashboard endpoint best-effort rather than
                         # failing on a concurrent dict resize.
-                        active_request_ids = set()
-                        active_requests = len(collectors)
+                        collector_request_ids = set()
 
                     sched = getattr(core, "scheduler", None)
                     if sched is not None and hasattr(sched, "snapshot_for_admin"):
                         snap = sched.snapshot_for_admin()
+                        has_scheduler_snapshot = True
                         running_by_id = snap["running_by_id"]
                         waiting_queue = snap["waiting"]
                         waiting_requests = len(waiting_queue)
@@ -4162,6 +4163,12 @@ def _build_active_models_data() -> dict:
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
+        if has_scheduler_snapshot:
+            active_request_ids = set(running_by_id) | prefilling_ids
+        elif collector_request_ids:
+            active_request_ids = collector_request_ids - waiting_ids
+        if has_scheduler_snapshot or collector_request_ids:
+            active_requests = len(active_request_ids)
 
         # Generating = active requests that finished prefill.
         generating = []
