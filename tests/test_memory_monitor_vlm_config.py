@@ -14,7 +14,12 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
-from omlx.memory_monitor import MemoryMonitor
+from omlx.memory_monitor import (
+    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
+    _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD,
+    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    MemoryMonitor,
+)
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 
@@ -167,6 +172,7 @@ class TestSetModelInfoForMonitorVLMWalk:
     def test_n_layer_alias_also_triggers_subconfig_selection(self):
         """GPT-style configs use ``n_layer`` instead of ``num_hidden_layers``.
         The walking helper must recognize both."""
+
         class _GPTStyleLM:
             n_layer = 24
             n_head = 16
@@ -185,9 +191,9 @@ class TestSetModelInfoForMonitorVLMWalk:
         sched._set_model_info_for_monitor()
 
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["num_layers"] == 24, (
-            "GPT-style ``n_layer`` in the sub-config should be recognized"
-        )
+        assert (
+            kwargs["num_layers"] == 24
+        ), "GPT-style ``n_layer`` in the sub-config should be recognized"
 
 
 class TestSetModelInfoTurboQuantDtype:
@@ -262,8 +268,7 @@ class TestSetModelInfoTurboQuantDtype:
 
         sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
         sched.model.make_cache.return_value = [
-            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2)
-            for i in range(40)
+            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(40)
         ]
         sched._turboquant_kv_bits = 4.0
         sched._turboquant_skip_last = True
@@ -348,3 +353,80 @@ class TestSetModelInfoTurboQuantDtype:
 
         assert full_dtype_peak > headroom
         assert turboquant_peak < headroom
+
+
+class TestSdpaTiledScratch:
+    """MLX >= 0.31 avoids the old full fp32 scores allocation for head_dim > 128,
+    but local peak measurements still show a bounded tiled scratch term."""
+
+    def test_tiled_scratch_constants_match_mlx_031_observation(self):
+        assert _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD == 128
+        assert _SDPA_TILED_SCRATCH_QUERY_TOKENS == 512
+        assert _SDPA_TILED_SCRATCH_DTYPE_SIZE == 2
+
+    def test_estimate_prefill_uses_tiled_scratch_for_large_head_dim(self):
+        """head_dim=256 must not use the old full fp32 score-matrix path."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        chunk = 512
+        new_tokens = 327872
+        full_kv_len = new_tokens
+
+        eff_chunk = min(chunk, new_tokens)
+        output_only = n_q * eff_chunk * hd * 4
+        old_full_scores = n_q * eff_chunk * full_kv_len * 4 + output_only
+        expected_attn = (
+            n_q
+            * min(eff_chunk, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+            * full_kv_len
+            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        )
+        expected_attn += output_only
+        kv = monitor.estimate_prompt_kv_bytes(new_tokens)
+        expected_peak = expected_attn + kv
+
+        actual = monitor.estimate_prefill_peak_bytes(new_tokens, chunk, cached_tokens=0)
+        assert actual == expected_peak, (
+            f"head_dim=256 should use tiled scratch formula "
+            f"({expected_peak:,} bytes), "
+            f"got {actual:,} bytes"
+        )
+        assert output_only < expected_attn < old_full_scores
+
+    def test_estimate_chunk_transient_uses_tiled_scratch_for_large_head_dim(self):
+        """head_dim=256 chunk transient must include the tiled scratch term."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        n_tokens = 512
+        kv_len = 327872
+
+        output_only = n_q * n_tokens * hd * 4
+        expected = (
+            n_q
+            * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+            * kv_len
+            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        )
+        expected += output_only
+        actual = monitor.estimate_chunk_transient_bytes(n_tokens, kv_len)
+        assert actual == expected, (
+            f"head_dim=256 chunk transient should be {expected:,} bytes, "
+            f"got {actual:,} bytes"
+        )
+        assert actual > output_only
