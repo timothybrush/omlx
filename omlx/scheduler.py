@@ -2667,9 +2667,8 @@ class Scheduler:
     _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512)
 
     # Safety margin applied to the headroom (hard_cap - current) when sizing
-    # a chunk predictively. The remaining 10% absorbs estimator error and the
-    # newly-allocated KV growth for this chunk that is not yet reflected in
-    # ``current`` (it is eval'd into residency after the forward pass).
+    # a chunk predictively. The remaining 10% absorbs estimator error and
+    # Metal command-buffer overhead above the modeled SDPA + KV growth.
     _PREFILL_HEADROOM_SAFETY: float = 0.90
 
     # Default fraction of the physical abort cap we allow a chunk's predicted
@@ -2686,17 +2685,18 @@ class Scheduler:
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
-        """Conservative predicted Metal transient (bytes) for one prefill chunk.
+        """Conservative predicted Metal peak growth for one prefill chunk.
 
         The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
         the per-token cost GROWS with context length. A long-run EWMA average
         lags that growth and underestimates the next chunk — the cause of the
         Metal command-buffer OOM crash at large kv_len. We therefore take the
         MAX of three signals and apply a safety factor:
-          - the most recently MEASURED per-token transient (last_delta /
-            last_n) — anchored on reality at the current kv_len regime,
+          - the most recently MEASURED per-token growth (last_delta / last_n)
+            — anchored on reality at the current kv_len regime,
           - the long-run EWMA (model-specific constants the static misses),
-          - the kv_len-aware static SDPA estimate.
+          - the kv_len-aware static estimate (SDPA transient + this chunk's
+            newly allocated KV).
         Returns 0 only when nothing is known (first chunk, no model info).
         """
         if n_tokens <= 0:
@@ -2711,8 +2711,11 @@ class Scheduler:
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
         if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
-            per_token = max(per_token, float(static))
+            static = self.memory_monitor.estimate_chunk_transient_bytes(
+                n_tokens, kv_len + n_tokens
+            )
+            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+            per_token = max(per_token, float(static) / n_tokens)
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
     def _prefill_abort_cap(self) -> int:
@@ -2844,7 +2847,7 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        per_token = self._predicted_chunk_transient(1, kv_len)
+        per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
         if n_fit < n_tokens:
@@ -2884,11 +2887,12 @@ class Scheduler:
           - Measured: once the per-scheduler EWMA has samples, use its
             ``bytes_per_token`` (× the same 1.2 safety factor ``predict()``
             applies) — this is measurement-based and model-agnostic.
-          - First chunk (no samples yet): fall back to the static SDPA
-            estimate ``memory_monitor.estimate_chunk_transient_bytes(1,
-            kv_len + 1)`` per token. ``kv_len`` is the current context span
-            (cached prefix + already-prefilled tokens), so a large
-            prefix-cache hit with a small suffix is throttled correctly.
+          - First chunk (no samples yet): fall back to the static SDPA + KV
+            growth estimate for the requested candidate chunk. ``kv_len`` is
+            the current context span (cached prefix + already-prefilled
+            tokens), so a large prefix-cache hit with a small suffix is
+            throttled correctly without classifying large prefill chunks as
+            vector-path traffic.
 
         The discrete watermark tiers are retained as a *secondary clamp* —
         they only ever shrink further, never enlarge the predicted size.
@@ -2906,7 +2910,7 @@ class Scheduler:
             loop_label: "external" or "chunked_step", used only for debug
                 log identification.
             kv_len: Current context span (base/cached + processed tokens)
-                used for the first-chunk static transient estimate.
+                used for the first-chunk static peak-growth estimate.
 
         Returns:
             The chunk size to actually process (>= 1, <= requested).
@@ -2919,11 +2923,11 @@ class Scheduler:
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
-        # Conservative per-token transient (measured-last / EWMA / static, ×
+        # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
-        # measurement so it tracks the transient's growth with kv_len instead
-        # of lagging behind a long-run average.
-        per_token = self._predicted_chunk_transient(1, kv_len)
+        # measurement so it tracks growth with kv_len instead of lagging behind
+        # a long-run average.
+        per_token = self._predicted_chunk_transient(requested, kv_len) / requested
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -2935,9 +2939,8 @@ class Scheduler:
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
 
         if per_token <= 0:
-            # No usable predictor (e.g. head_dim<=128 fused kernel where the
-            # transient is O(n), or model info unavailable). Fall back to the
-            # legacy watermark gate so we never run unbounded.
+            # No usable predictor (e.g. model info unavailable). Fall back to
+            # the legacy watermark gate so we never run unbounded.
             if current < soft_watermark:
                 return requested
             n_fit = requested
@@ -3004,6 +3007,31 @@ class Scheduler:
         """Return the last MLX active-memory sample taken on the executor."""
         return self._last_mlx_active_memory_bytes
 
+    def _hot_cache_cpu_bytes(self) -> int:
+        """Return serialized hot-cache bytes safe to exclude from phys guard."""
+        config = getattr(self, "config", None)
+        budget = getattr(config, "hot_cache_budget", None)
+        if budget is not None:
+            try:
+                return max(0, int(getattr(budget, "total_bytes", 0)))
+            except Exception:
+                logger.debug("Failed to read shared hot-cache byte budget")
+                return 0
+
+        manager = getattr(self, "paged_ssd_cache_manager", None)
+        if manager is None:
+            return 0
+
+        try:
+            stats = manager.get_stats()
+            return max(0, int(getattr(stats, "hot_cache_size_bytes", 0)))
+        except Exception:
+            try:
+                return max(0, int(getattr(manager, "_hot_cache_total_bytes", 0)))
+            except Exception:
+                logger.debug("Failed to read local hot-cache byte counter")
+                return 0
+
     def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
         """Current memory usage for scheduler-side guard checks.
 
@@ -3015,7 +3043,13 @@ class Scheduler:
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
-        return max(active, get_phys_footprint())
+        hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
+        if callable(hot_cache_cpu_bytes):
+            hot_cache_bytes = hot_cache_cpu_bytes()
+        else:
+            hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
+        phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
+        return max(active, phys)
 
     def _record_chunk_transient(
         self,
@@ -5853,8 +5887,8 @@ class Scheduler:
         (model weights + KV cache + SDPA activation/scratch) and rejects
         if it would exceed the hard limit.
 
-        Current MLX avoids the old full fp32 attention matrix for
-        head_dim > 128, but still needs a bounded tiled scratch term.
+        Mirrors MLX SDPA dispatch closely enough that unsupported prefill
+        head dimensions are charged for the unfused fp32 score matrix.
 
         Returns:
             ``_PreflightRejection`` carrying the message + numeric
