@@ -81,6 +81,10 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
+COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+
+DIFFUSION_PREFILL_STEP_SIZE = 2048
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -102,6 +106,79 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 8192,
     },
 }
+
+
+def _read_config_model_type(model_path: str | Path) -> str | None:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return None
+    model_type = data.get("model_type")
+    return model_type if isinstance(model_type, str) else None
+
+
+def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
+    from mlx_vlm.tokenizer_utils import load_tokenizer
+    from mlx_vlm.utils import StoppingCriteria
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+
+    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+    tokenizer.detokenizer = detokenizer_class(tokenizer)
+
+    final_eos_token_ids = (
+        eos_token_id
+        or getattr(tokenizer, "eos_token_ids", None)
+        or getattr(tokenizer, "eos_token_id", None)
+    )
+    tokenizer.stopping_criteria = StoppingCriteria(final_eos_token_ids, tokenizer)
+    return tokenizer
+
+
+def _load_cohere2_moe_text_model(
+    model_name: str,
+    *,
+    trust_remote_code: bool = False,
+):
+    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    from mlx_vlm.utils import get_model_path, load_model, load_processor
+    from transformers import AutoTokenizer
+
+    model_path = get_model_path(model_name)
+    model = load_model(
+        model_path,
+        lazy=False,
+        strict=True,
+        trust_remote_code=trust_remote_code,
+    )
+
+    eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    try:
+        processor = load_processor(
+            model_path,
+            True,
+            eos_token_ids=eos_token_id,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as exc:
+        logger.debug(
+            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "falling back to AutoTokenizer: %s",
+            model_name,
+            exc,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
+        processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
+
+    return model, processor
+
 
 _video_processor_patched = False
 
@@ -869,6 +946,12 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
+                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
+                    return _load_cohere2_moe_text_model(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
+
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
                 )
@@ -1049,11 +1132,12 @@ class VLMBatchedEngine(BaseEngine):
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
-        """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
+        """Attach a loaded MTP drafter for VLM MTP decoding.
 
         Passes the drafter (and the configured draft-block size) down to
         the scheduler so eligible requests get routed to mlx-vlm's MTP
-        round loop at decode time.
+        round loop at decode time.  Supports gemma4_assistant and
+        qwen3_5_mtp drafter types.
         """
         self._vlm_mtp_drafter = drafter
         block_size = None
@@ -1632,6 +1716,14 @@ class VLMBatchedEngine(BaseEngine):
         num_images = len(images)
         num_audios = len(audio) if audio else 0
 
+        model_type = self.model_type or ""
+        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+            raise InvalidRequestError(
+                "Cohere2 MoE is a text-only model and does not support "
+                "image or audio input.",
+                field="messages",
+            )
+
         # Normalize audio to numpy float32 arrays expected by processor.
         # extract_images_from_messages produces BytesIO / file-path strings, but
         # the processor's __call__ expects numpy arrays or (array, sample_rate)
@@ -1644,13 +1736,8 @@ class VLMBatchedEngine(BaseEngine):
 
                 ensure_mlx_audio_resample_export()
             audio = [
-                _load_audio(a, 16000)
-                if not isinstance(a, tuple)
-                else a
-                for a in audio
+                _load_audio(a, 16000) if not isinstance(a, tuple) else a for a in audio
             ]
-        model_type = self.model_type or ""
-
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
             raise ValueError(
@@ -1835,8 +1922,6 @@ class VLMBatchedEngine(BaseEngine):
         has_audio = "input_features" in extra_model_inputs
         has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
-
-
         if has_multimodal:
             # Build call kwargs from extra_model_inputs (includes input_features
             # for audio, image_grid_thw, etc.)
@@ -1849,7 +1934,11 @@ class VLMBatchedEngine(BaseEngine):
                 image_hash = compute_image_hash(images)
                 image_token_count = self._image_token_count(input_ids)
 
-            if num_images > 0 and self._vision_cache is not None and self._vision_cache_enabled:
+            if (
+                num_images > 0
+                and self._vision_cache is not None
+                and self._vision_cache_enabled
+            ):
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
@@ -2923,6 +3012,7 @@ class VLMBatchedEngine(BaseEngine):
                         getattr(tokenizer, "all_special_ids", None) or []
                     ),
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
+                    prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
                 )
                 for result in results:
                     if cancel_event is not None and cancel_event.is_set():
@@ -2934,8 +3024,7 @@ class VLMBatchedEngine(BaseEngine):
                     result_text = result.text or ""
                     if result_text:
                         has_token_progress = (
-                            result_tokens is None
-                            or int(result_tokens) > emitted_tokens
+                            result_tokens is None or int(result_tokens) > emitted_tokens
                         )
                         has_final_flush = (
                             finish_reason is not None
@@ -2968,6 +3057,25 @@ class VLMBatchedEngine(BaseEngine):
                             finished=finish_reason is not None,
                             finish_reason=finish_reason,
                             cached_tokens=0,
+                            prompt_tps=float(getattr(result, "prompt_tps", 0.0) or 0.0),
+                            generation_tps=float(
+                                getattr(result, "generation_tps", 0.0) or 0.0
+                            ),
+                            diffusion_canvas_tokens=int(
+                                getattr(result, "diffusion_canvas_tokens", 0) or 0
+                            ),
+                            diffusion_denoising_steps=int(
+                                getattr(result, "diffusion_denoising_steps", 0) or 0
+                            ),
+                            diffusion_work_tokens=int(
+                                getattr(result, "diffusion_work_tokens", 0) or 0
+                            ),
+                            diffusion_canvas_tps=float(
+                                getattr(result, "diffusion_canvas_tps", 0.0) or 0.0
+                            ),
+                            diffusion_work_tps=float(
+                                getattr(result, "diffusion_work_tps", 0.0) or 0.0
+                            ),
                         )
                     block_text = []
                     if finish_reason:
