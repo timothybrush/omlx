@@ -19,7 +19,7 @@ import concurrent.futures
 import json
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
@@ -962,7 +962,10 @@ class TestPrefillAbortInterrupt:
                     cache,
                 )
 
-        clear_cache.assert_called_once_with(scheduler._stream)
+        assert clear_cache.call_args_list == [
+            call(scheduler._stream),
+            call(scheduler._stream),
+        ]
         assert request._prefill_saved_rope_deltas is None
 
     def test_prefill_abort_cleanup_removes_temp_uid_and_pending_abort(
@@ -2890,6 +2893,34 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
+    def test_memory_guard_fails_persistent_admission_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = self._make_request("req-stalled")
+        self._queue_request(scheduler, request)
+        running = self._make_request("req-running")
+        scheduler.running[running.request_id] = running
+        scheduler.requests[running.request_id] = running
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=101)
+        scheduler._memory_admission_blocked_request_id = request.request_id
+        scheduler._memory_admission_blocked_since = 0.0
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "memory_admission_stalled"
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        assert scheduler.running[running.request_id] is running
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):
@@ -3124,9 +3155,7 @@ class TestBatchGeneratorAllTokens:
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert call_kwargs["all_tokens"] == [[]]
 
-    def test_concurrent_inserts_keep_per_request_seed(
-        self, mock_model, mock_tokenizer
-    ):
+    def test_concurrent_inserts_keep_per_request_seed(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         first = Request(
             request_id="req-concurrent-a",
@@ -3827,3 +3856,57 @@ class TestTurboQuantMLAGuard:
         assert scheduler._model_uses_mla() is False
         assert scheduler._model_uses_mla() is False
         assert calls["n"] == 1  # walked once, then cached
+
+
+class TestTurboQuantAttentionSinkGuard:
+    """Attention-sink models must not use TQ kernels that drop sink logits."""
+
+    def test_attention_sink_model_ineligible_by_module_mapping(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(),
+            modules=lambda: [{"sinks": mx.zeros((8,))}],
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_attention_sink_model_ineligible_by_module_attribute(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        attn = SimpleNamespace(sinks=mx.zeros((8,)))
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(), modules=lambda: [attn]
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_standard_model_without_sinks_still_eligible(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(model_type="llama"), modules=lambda: []
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is False
+        assert scheduler._turboquant_eligible([KVCache()]) is True
