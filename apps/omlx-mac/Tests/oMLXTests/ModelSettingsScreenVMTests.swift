@@ -69,6 +69,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             isLoading: false,
             estimatedSize: 0,
             estimatedSizeFormatted: nil,
+            actualSize: nil,
+            actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
             isFavorite: nil,
@@ -81,6 +83,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            virtual: nil,
             settings: nil
         )
     }
