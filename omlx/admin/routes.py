@@ -1063,15 +1063,20 @@ templates.env.globals["current_lang"] = "en"
 
 
 def _load_locale(language: str) -> dict:
-    """Load locale dict for a given language code. Falls back to en on error."""
+    """Load locale dict and fill missing keys from English."""
+    fallback = dict(_en_locale)
     path = _i18n_dir / f"{language}.json"
+    if language == "en":
+        return fallback
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        locale = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         try:
             return json.loads((_i18n_dir / "en.json").read_text(encoding="utf-8"))
         except Exception:
             return {}
+    fallback.update(locale)
+    return fallback
 
 
 def _make_t(locale: dict):
@@ -1901,6 +1906,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            # Native context window from the model's config.json — used by
+            # the context bench UI to hide targets the model cannot reach.
+            "model_context_length": model_info.get("model_context_length"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "source_type": model_info.get("source_type", "local"),
