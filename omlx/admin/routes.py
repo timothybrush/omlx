@@ -277,8 +277,6 @@ class GlobalSettingsRequest(BaseModel):
     sampling_repetition_penalty: float | None = None
 
     # Claude Code settings
-    claude_code_context_scaling_enabled: bool | None = None
-    claude_code_target_context_size: int | None = None
     claude_code_mode: str | None = None
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
@@ -354,6 +352,7 @@ class OQStartRequest(BaseModel):
     imatrix_strict: bool = False
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
+    mtp_assistant_model_path: str = ""
 
 
 class HFUploadRequest(BaseModel):
@@ -3247,8 +3246,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
-            "context_scaling_enabled": global_settings.claude_code.context_scaling_enabled,
-            "target_context_size": global_settings.claude_code.target_context_size,
             "mode": global_settings.claude_code.mode,
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
@@ -3754,16 +3751,6 @@ async def update_global_settings(
 
     # Apply Claude Code settings (Live - immediately applied)
     claude_code_changed = False
-    if request.claude_code_context_scaling_enabled is not None:
-        global_settings.claude_code.context_scaling_enabled = (
-            request.claude_code_context_scaling_enabled
-        )
-        claude_code_changed = True
-    if request.claude_code_target_context_size is not None:
-        global_settings.claude_code.target_context_size = (
-            request.claude_code_target_context_size
-        )
-        claude_code_changed = True
     # mode: standard is-not-None check is correct — mode must never be null
     if request.claude_code_mode is not None:
         global_settings.claude_code.mode = request.claude_code_mode
@@ -3785,8 +3772,6 @@ async def update_global_settings(
         runtime_applied.append("claude_code")
         logger.info(
             f"Claude Code settings updated: "
-            f"scaling={'enabled' if global_settings.claude_code.context_scaling_enabled else 'disabled'}, "
-            f"target={global_settings.claude_code.target_context_size}, "
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
@@ -4485,16 +4470,6 @@ async def get_server_stats(
         "port": port,
         "api_key": api_key or "",
         "cli_prefix": get_cli_prefix(),
-        "claude_code_context_scaling_enabled": (
-            global_settings.claude_code.context_scaling_enabled
-            if global_settings
-            else False
-        ),
-        "claude_code_target_context_size": (
-            global_settings.claude_code.target_context_size
-            if global_settings
-            else 200000
-        ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,
@@ -6673,6 +6648,7 @@ async def start_oq_quantization(
             imatrix_strict=request.imatrix_strict,
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
+            mtp_assistant_model_path=request.mtp_assistant_model_path,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

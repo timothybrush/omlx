@@ -101,7 +101,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -416,6 +416,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
@@ -2448,8 +2449,6 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            claude_code_context_scaling_enabled: this.globalSettings.claude_code.context_scaling_enabled,
-                            claude_code_target_context_size: this.globalSettings.claude_code.target_context_size,
                             claude_code_mode: this.globalSettings.claude_code.mode,
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
@@ -4870,6 +4869,8 @@
                         text_only: this.oqTextOnly,
                         dtype: this.oqDtype,
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                            ? this.oqMtpAssistantPath : '',
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -4978,6 +4979,15 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqMtpAssistantCandidates() {
+                // Gemma 4 ships its MTP head as a separate gemma4_assistant
+                // checkpoint; offer to merge it into the quantized output.
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source || source.model_type !== 'gemma4') return [];
+                return this.oqAllModels.filter(m => m.model_type === 'gemma4_assistant');
             },
 
             oqLevelLabel(level) {
