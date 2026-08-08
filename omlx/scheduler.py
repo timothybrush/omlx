@@ -49,7 +49,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -5519,7 +5519,7 @@ class Scheduler:
         """
         if not snapshot_cache:
             return
-        extracted, _ = self._extract_cache_states(snapshot_cache)
+        extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
         leaves = self._collect_arrays_from_extracted_cache(extracted)
         if leaves:
             with mx.stream(self._stream):
@@ -5570,7 +5570,7 @@ class Scheduler:
                     request_id,
                     token_count,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -5618,6 +5618,45 @@ class Scheduler:
         self._eval_snapshot_cache(snapshot_cache)
         return snapshot_cache
 
+    def _extract_snapshot_cache_states(
+        self, snapshot_cache: list[Any]
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Extract snapshot states with sliceable CacheList members blanked.
+
+        Boundary snapshots exist for non-sliceable state; for mixed
+        CacheList layers eligible for per-member block storage the KV
+        member is sliced from the live cache at store time and never read
+        from the snapshot. Persisting it anyway made every boundary
+        snapshot carry the full KV prefix — quadratic in context length
+        across a request's snapshots (RAM transients and the boundary
+        SSD store). Blank those members to ``()``;
+        ``_merge_boundary_with_full_cache`` refills them member-wise when
+        a snapshot is promoted to a store source.
+        """
+        extracted, tokens = self._extract_cache_states(snapshot_cache)
+        for layer in extracted or []:
+            if not isinstance(layer, dict):
+                continue
+            if str(layer.get("class_name") or "") != "CacheList":
+                continue
+            state = layer.get("state")
+            meta = layer.get("meta_state")
+            if not (
+                isinstance(state, list)
+                and isinstance(meta, (list, tuple))
+                and len(meta) >= 1
+                and isinstance(meta[0], (list, tuple))
+            ):
+                continue
+            plan = cachelist_pm_member_plan([str(n) for n in meta[0]], state)
+            if plan is None:
+                continue
+            layer["state"] = [
+                () if mode == "slice" else sub_state
+                for mode, sub_state in zip(plan, state)
+            ]
+        return extracted, tokens
+
     def _decode_boundary_snapshot_value(
         self, snapshot_cache: list[Any], token_count: int, block_size: int
     ) -> Any:
@@ -5629,12 +5668,18 @@ class Scheduler:
         PoolingCache case so its cumulative ``pooled`` tensor can be stored as
         a single-block delta.
         """
+        # Extract eagerly instead of retaining raw cache objects: a raw
+        # CacheList keeps its full KV member alive for every recorded
+        # boundary, which reintroduces the quadratic RAM cost in the
+        # SSD-store-unavailable fallback (#2551). The extraction path runs
+        # the per-member snapshot filter (_extract_snapshot_cache_states),
+        # so pm-eligible layers hold only their small non-sliceable state.
+        value = self._prefill_snapshot_value(snapshot_cache)
         if not _contains_pooling_cache(snapshot_cache):
-            self._eval_snapshot_cache(snapshot_cache)
-            return snapshot_cache
+            return value
 
         return _compact_boundary_snapshot_value(
-            self._prefill_snapshot_value(snapshot_cache),
+            value,
             token_count,
             block_size,
             self._stream,
@@ -5674,7 +5719,7 @@ class Scheduler:
                 mx.default_device()
             )
             with mx.stream(stream):
-                extracted, _ = self._extract_cache_states(snapshot_cache)
+                extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
                 if not extracted:
                     return None
                 for layer_state in extracted:
@@ -5868,7 +5913,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -6008,7 +6053,7 @@ class Scheduler:
                 provider_tcs.append(tc)
                 continue
 
-            extracted_snapshot, _ = self._extract_cache_states(snap)
+            extracted_snapshot, _ = self._extract_snapshot_cache_states(snap)
             if extracted_snapshot:
                 extracted_in_memory[tc] = extracted_snapshot
                 provider_tcs.append(tc)
@@ -6055,6 +6100,31 @@ class Scheduler:
             if isinstance(state, tuple) and len(state) == 0:
                 # Take full cache layer instead.
                 merged.append(fc)
+                continue
+            # Member-filtered CacheList snapshots
+            # (_extract_snapshot_cache_states) blank sliceable members to
+            # ``()``. Refill those member-wise from the full extracted
+            # layer so the store path sees real KV tensors to slice; the
+            # snapshot's non-sliceable members stay authoritative.
+            full_state = fc.get("state") if isinstance(fc, dict) else None
+            if (
+                isinstance(state, list)
+                and isinstance(full_state, list)
+                and len(state) == len(full_state)
+                and any(
+                    isinstance(s, (list, tuple)) and len(s) == 0 for s in state
+                )
+            ):
+                refilled = dict(bc)
+                refilled["state"] = [
+                    (
+                        full_sub
+                        if isinstance(sub, (list, tuple)) and len(sub) == 0
+                        else sub
+                    )
+                    for sub, full_sub in zip(state, full_state)
+                ]
+                merged.append(refilled)
             else:
                 merged.append(bc)
         return merged
@@ -6065,6 +6135,68 @@ class Scheduler:
             return False
         state = layer_state.get("state", ())
         return isinstance(state, tuple) and len(state) == 0
+
+    @staticmethod
+    def _has_blanked_cachelist_members(layer_state: Any) -> bool:
+        """True for a member-filtered CacheList layer (some sub states ``()``).
+
+        ``_extract_snapshot_cache_states`` blanks the sliceable members of
+        pm-eligible CacheList layers; such a layer is not a whole-layer
+        placeholder (``state`` is a list), so ``_is_empty_boundary_placeholder``
+        does not see it.
+        """
+        if not isinstance(layer_state, dict):
+            return False
+        state = layer_state.get("state")
+        if not isinstance(state, list):
+            return False
+        return any(
+            isinstance(sub, (list, tuple)) and len(sub) == 0 for sub in state
+        )
+
+    @staticmethod
+    def _refill_blanked_cachelist_members(
+        boundary_cache: list[dict[str, Any]],
+        live_cache: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Refill member-blanked CacheList layers from the live extracted cache.
+
+        A store source assembled from a member-filtered snapshot needs its
+        blanked sliceable subs refilled before storing — the store path
+        slices KV positionally, so the longer live sequence is a valid
+        source. Only member-blanked CacheList layers are touched;
+        whole-layer placeholders keep going through
+        ``_fill_boundary_placeholders_from_live_cache`` and its
+        sliceable-proof guard. Returns None when the live cache cannot
+        supply a blanked member, so the caller skips the store instead of
+        persisting a partial composite.
+        """
+        if len(boundary_cache) != len(live_cache):
+            return None
+        merged: list[dict[str, Any]] = []
+        for boundary_layer, live_layer in zip(boundary_cache, live_cache):
+            if not Scheduler._has_blanked_cachelist_members(boundary_layer):
+                merged.append(boundary_layer)
+                continue
+            state = boundary_layer.get("state")
+            live_state = (
+                live_layer.get("state") if isinstance(live_layer, dict) else None
+            )
+            if not isinstance(live_state, list) or len(live_state) != len(state):
+                return None
+            refilled = dict(boundary_layer)
+            refilled["state"] = [
+                (
+                    live_sub
+                    if isinstance(sub, (list, tuple)) and len(sub) == 0
+                    else sub
+                )
+                for sub, live_sub in zip(state, live_state)
+            ]
+            if Scheduler._has_blanked_cachelist_members(refilled):
+                return None
+            merged.append(refilled)
+        return merged
 
     @staticmethod
     def _extracted_layer_type_name(layer_state: dict[str, Any]) -> str:
@@ -6227,10 +6359,18 @@ class Scheduler:
                 intermediate_snapshots,
             ) = boundary_override
 
-            live_payload = None
-            if any(
+            needs_placeholder_fill = any(
                 self._is_empty_boundary_placeholder(layer) for layer in boundary_cache
-            ):
+            )
+            # Member-filtered snapshots blank the sliceable subs of
+            # pm-eligible CacheList layers to ``()``. Storing them unfilled
+            # drops the KV member from the block payload, and the resulting
+            # short-payload blocks stay a permanent miss for that prefix
+            # through token-hash dedup until restart.
+            needs_member_refill = any(
+                self._has_blanked_cachelist_members(layer) for layer in boundary_cache
+            )
+            if needs_placeholder_fill or needs_member_refill:
                 live_payload = self._extract_live_request_cache_for_store(
                     request_id,
                     uid,
@@ -6239,12 +6379,21 @@ class Scheduler:
                 if live_payload is None:
                     return None
                 live_cache, live_model_config = live_payload
-                cache_to_store = self._fill_boundary_placeholders_from_live_cache(
-                    boundary_cache,
-                    live_cache,
-                )
-                if cache_to_store is None:
-                    return None
+                cache_to_store = boundary_cache
+                if needs_member_refill:
+                    cache_to_store = self._refill_blanked_cachelist_members(
+                        cache_to_store,
+                        live_cache,
+                    )
+                    if cache_to_store is None:
+                        return None
+                if needs_placeholder_fill:
+                    cache_to_store = self._fill_boundary_placeholders_from_live_cache(
+                        cache_to_store,
+                        live_cache,
+                    )
+                    if cache_to_store is None:
+                        return None
                 model_cache_config = boundary_model_config or live_model_config
             else:
                 cache_to_store = boundary_cache
