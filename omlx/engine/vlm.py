@@ -3133,6 +3133,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3142,6 +3143,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3242,6 +3244,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3253,6 +3256,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3360,6 +3364,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         )
 
@@ -3579,6 +3584,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         ):
             yield output

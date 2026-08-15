@@ -19,6 +19,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
+from omlx.custom_kernels.nax import is_nax_available
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -69,6 +71,13 @@ def _is_supported_affine_linear_shape(
         return False
     if not _qmm_supports_group_size(int(group_size)):
         return False
+    if (
+        group_size == 128
+        and os.environ.get("OMLX_QWEN35_Q4_MLP_ALLOW_GS128") != "1"
+        and is_nax_available()
+    ):
+        # The custom gs128 tile cannot use NAX; stock MLX can on M5 hardware.
+        return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
         return False
@@ -81,11 +90,7 @@ def _is_supported_affine_linear_shape(
     biases = getattr(linear, "biases", None)
     if weight is None or scales is None or biases is None:
         return False
-    if (
-        weight.dtype != mx.uint32
-        or scales.dtype != dtype
-        or biases.dtype != dtype
-    ):
+    if weight.dtype != mx.uint32 or scales.dtype != dtype or biases.dtype != dtype:
         return False
     if weight.ndim != 2 or scales.ndim != 2 or biases.ndim != 2:
         return False
@@ -95,7 +100,10 @@ def _is_supported_affine_linear_shape(
         return False
     if scales.shape != biases.shape:
         return False
-    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // group_size
+    return (
+        scales.shape[0] == weight.shape[0]
+        and scales.shape[1] == input_dim // group_size
+    )
 
 
 def _is_supported_affine_linear(linear: Any, x: mx.array) -> bool:
