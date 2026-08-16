@@ -1028,8 +1028,9 @@
                 this.clusterShowPeerAdvanced = true;
                 if (!this.clusterSshKey) await this.loadClusterSshKey();
                 await this.$nextTick();
+                const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
                 document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
-                    behavior: 'smooth',
+                    behavior: reduced ? 'auto' : 'smooth',
                     block: 'center',
                 });
             },
@@ -9331,6 +9332,22 @@
                                     if (!exists) {
                                         data.data._showCategories = false;
                                         this.accAllResults.push(data.data);
+                                    }
+                                }
+                                break;
+                            case 'upload':
+                                // Community upload outcome for one suite. Idempotent
+                                // on replay: keyed to the same (model_id, benchmark)
+                                // as its result card. Array reassign for reactivity.
+                                {
+                                    const idx = this.accAllResults.findIndex(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (idx >= 0) {
+                                        const updated = { ...this.accAllResults[idx], upload: data.data };
+                                        this.accAllResults.splice(idx, 1, updated);
+                                        this.accAllResults = [...this.accAllResults];
                                     }
                                 }
                                 break;

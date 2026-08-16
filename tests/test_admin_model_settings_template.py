@@ -1,5 +1,6 @@
 """Regression tests for admin model-settings UI gates."""
 
+import json
 from pathlib import Path
 
 
@@ -13,6 +14,11 @@ def _model_settings_template() -> str:
 def _dashboard_script() -> str:
     root = Path(__file__).resolve().parents[1]
     return (root / "omlx/admin/static/js/dashboard.js").read_text()
+
+
+def _status_template() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/templates/dashboard/_status.html").read_text()
 
 
 def _section(html: str, start_marker: str, end_marker: str) -> str:
@@ -94,3 +100,34 @@ def test_reasoning_effort_reload_restores_preset_or_custom_editor():
     assert "value: isPreset ? value : 'low'" in branch
     assert "custom: !isPreset" in branch
     assert "customValue: isPreset ? '' : String(value)" in branch
+
+
+def test_model_settings_feature_labels_use_i18n_keys():
+    modal_html = _model_settings_template()
+    status_html = _status_template()
+
+    assert "{{ t('modal.model_settings.reasoning_parser') }}" in modal_html
+    assert "{{ t('modal.model_settings.specprefill') }}" in modal_html
+    assert "{{ t('modal.model_settings.dflash') }}" in modal_html
+    assert "{{ t('status.active_models.dflash_label') }}" in status_html
+
+    assert ">Reasoning Parser</label>" not in modal_html
+    assert ">SpecPrefill</span>" not in modal_html
+    assert ">DFlash</span>" not in modal_html
+    assert ">DFlash</span>" not in status_html
+
+
+def test_model_settings_feature_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.reasoning_parser",
+        "modal.model_settings.specprefill",
+        "modal.model_settings.dflash",
+        "status.active_models.dflash_label",
+    }
+
+    for locale_path in sorted(i18n_dir.glob("*.json")):
+        translations = json.loads(locale_path.read_text())
+        missing_keys = keys - translations.keys()
+        assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
