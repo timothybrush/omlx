@@ -1742,6 +1742,27 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
+        # fused prefill routes favor wider chunks. Measured on the 27B
+        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
+        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
+        # at 4096 when the machine has headroom; the prefill memory guard
+        # still shrinks chunks under pressure, so small Macs are unchanged.
+        self._qwen35_prefill_floor = 0
+        try:
+            _mt = str(getattr(model, "model_type", "") or "")
+            if not _mt:
+                _mt = str(
+                    getattr(getattr(model, "config", None), "model_type", "") or ""
+                )
+            if _mt.startswith("qwen3_5"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._qwen35_prefill_floor = 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -4800,7 +4821,11 @@ class Scheduler:
 
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
-            return self.config.prefill_step_size
+            size = self.config.prefill_step_size
+            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            if floor and size < floor:
+                size = floor
+            return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
@@ -8023,27 +8048,39 @@ class Scheduler:
             )
             return None
 
-        # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
-        # the module instance, so multiple in-flight ``_mtp_rounds`` generators
-        # share one drafter and effectively serialize on it: each round has
-        # to ``set_shared_kv`` for its own request before ``draft_block`` runs.
-        # Output stays correct because target-side verify is the source of
-        # truth in speculative decoding (a stale-drafter round just rejects
-        # everything and falls back to a target-only step), but the
-        # per-request tok/s is roughly halved under concurrency. Empirically
-        # at 4 concurrent, vlm_mtp gives ~14 tok/s each vs BatchGenerator's
-        # ~27 tok/s each — BG's batched matmul beats serialized speculative
-        # rounds. So we route only the first eligible request through
-        # vlm_mtp and let subsequent concurrent requests fall back. A future
-        # commit can swap this gate for true batched MTP via
-        # ``_mtp_rounds_batch`` if and when omlx prefill exposes batched
-        # hidden/shared_kv outputs.
+        # The drafter stores request-specific state on the module instance, so
+        # only one vlm_mtp generator can own it at a time. A request that
+        # arrives after MTP has started cannot be migrated here; retain the
+        # existing safe BatchGenerator fallback for that late-arrival case.
         if self._vlm_mtp_active:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
                 "request(s); falling back to BatchGenerator",
                 request.request_id,
                 len(self._vlm_mtp_active),
+            )
+            return None
+
+        # Prefer ordinary batching when a peer is already ready or admitted.
+        # Starting MTP for the first request and falling its peers back creates
+        # a slower mixed decode group, while also paying this path's extra
+        # final target forward. A chunked-prefill request still appears in
+        # ``prefilling`` while it is finalized, so exclude the request itself.
+        waiting_count = len(getattr(self, "waiting", ()))
+        running_count = len(getattr(self, "running", ()))
+        prefilling_count = sum(
+            getattr(prefill, "request_id", None) != request.request_id
+            for prefill in getattr(self, "prefilling", ())
+        )
+        if waiting_count or running_count or prefilling_count:
+            logger.info(
+                "vlm_mtp routing skipped for %s: scheduler contention "
+                "(running=%d waiting=%d prefilling=%d); falling back to "
+                "BatchGenerator",
+                request.request_id,
+                running_count,
+                waiting_count,
+                prefilling_count,
             )
             return None
 
