@@ -42,6 +42,34 @@ def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
     assert source.count("begin_ane_ticket_pair(") == 3
 
 
+def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
+    """A thread-constructor failure must leave every unowned ticket guarded."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+    fused = source.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[1]
+
+    assert "void transfer_ticket0() noexcept" in source
+    assert "void transfer_ticket1() noexcept" in source
+    assert dual.index("std::thread([model0") < dual.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert dual.index("std::thread([model1") < dual.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert fused.index("std::thread([model =") < fused.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert fused.index("std::thread([model1 =") < fused.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert source.count("ane_guard.transfer_ticket0();") == 2
+    assert source.count("ane_guard.transfer_ticket1();") == 2
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
@@ -3061,6 +3089,31 @@ def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
 
 
+def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
+    """A cache-rooted path that resolves elsewhere must be left alone, while
+    the historical temp path still deletes directly."""
+    body = re.search(
+        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
+        ane_mm,
+        re.S,
+    )
+    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
+    assert "ANE compile cache cleanup skipped" in body.group()
+    assert "stringByResolvingSymlinksInPath" in body.group()
+
+
+def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
+    """Never unlink a lock path while waiters may hold its old inode open.
+
+    Recreating the pathname would establish a second lock domain and allow
+    two processes to mutate the same staging directory concurrently.
+    """
+    assert "NSString *ane_compile_cache_lock_path(NSString *entry_directory)" in ane_mm
+    assert ane_mm.count("ane_compile_cache_lock_path(") == 2
+    assert "unlink(ane_compile_cache_lock_path" not in ane_mm
+    assert "Never unlink this path" in ane_mm
+
+
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
     """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
     assert "persistent_" not in ane_mm
@@ -3130,13 +3183,11 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
-    from types import SimpleNamespace as NS
-
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
-    model.mlp._omlx_ane_prefill_state = NS(model=handle)
-    model.gdn._omlx_ane_gdn_state = NS(model=_NativeHandle())
+    model.mlp._omlx_ane_prefill_state = SimpleNamespace(model=handle)
+    model.gdn._omlx_ane_gdn_state = SimpleNamespace(model=_NativeHandle())
     model._omlx_ane_mlp_prefill_count = 1
     model._omlx_ane_gdn_prefill_count = 1
     model._omlx_ane_dual_prefill_count = 1
@@ -3164,10 +3215,109 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
 
 
 def test_release_is_idempotent_and_noop_without_slices():
-    from types import SimpleNamespace as NS
-
     model = _ReleasableModel()
     assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
-    model.mlp._omlx_ane_prefill_state = NS(model=_NativeHandle())
+    model.mlp._omlx_ane_prefill_state = SimpleNamespace(model=_NativeHandle())
     ane_patch.release_qwen35_ane_prefill(model)
     assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
+# --- dashboard toggle for the compile cache ---
+
+
+def test_compile_cache_setting_round_trips_and_defaults_off():
+    """The advanced-settings toggle must persist in settings.json and stay
+    off for installs that predate it."""
+    from omlx.settings import CacheSettings
+
+    cache = CacheSettings(ane_compile_cache=True)
+    assert CacheSettings.from_dict(cache.to_dict()).ane_compile_cache is True
+
+    assert CacheSettings.from_dict({}).ane_compile_cache is False
+    assert CacheSettings().ane_compile_cache is False
+
+
+def test_compile_cache_setting_exports_the_native_env_gate(monkeypatch):
+    """serve exports the env var the native gate reads once at the first
+    compile; an explicit env override wins."""
+    import os
+
+    source = (
+        Path(__file__).resolve().parents[1] / "omlx/cli.py"
+    ).read_text(encoding="utf-8")
+    assert 'os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")' in source
+
+    monkeypatch.delenv("OMLX_QWEN35_ANE_COMPILE_CACHE", raising=False)
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "1"
+
+    monkeypatch.setenv("OMLX_QWEN35_ANE_COMPILE_CACHE", "0")
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "0"
+
+
+# --- below-floor GDN fraction is explained, not silent (#2899, #2905) ---
+
+
+def _floor_gdn(z_outputs: int, qkv_outputs: int):
+    return SimpleNamespace(
+        in_proj_z=SimpleNamespace(weight=SimpleNamespace(shape=(z_outputs, 1))),
+        in_proj_qkv=SimpleNamespace(weight=SimpleNamespace(shape=(qkv_outputs, 1))),
+    )
+
+
+def test_min_viable_gdn_fraction_tracks_the_alignment():
+    """Single-ANE slices align to 64, dual to 128, so the same model has a
+    different floor in each mode."""
+    gdn = _floor_gdn(512, 1536)
+
+    assert ane_patch._min_viable_gdn_fraction(gdn, 128) == 0.25
+    total = 2048
+    assert (int(total * 0.25) // 128) * 128 >= 512
+    assert (int(total * 0.15) // 128) * 128 < 512
+
+    # A 64-aligned slice reaches z at the same 0.25 here, but the rule is
+    # evaluated against the requested alignment, not a fixed 128.
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 64) == 0.15625
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) == 0.1875
+
+    # z alone larger than the whole projection can never engage
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None
+
+
+def test_warn_gdn_below_floor_names_the_floor(monkeypatch, caplog):
+    model = SimpleNamespace(modules=lambda: [_floor_gdn(512, 1536)])
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda module: True)
+
+    with caplog.at_level(logging.WARNING):
+        ane_patch._warn_gdn_below_floor(model, True, 0, 0.15, True)
+
+    assert "0.150" in caplog.text and "0.250" in caplog.text
+
+
+def test_warn_gdn_below_floor_stays_quiet_when_the_fraction_is_viable(
+    monkeypatch, caplog
+):
+    """Only a below-floor fraction gets the warning: a 0 count from a compile
+    failure or from GDN being off has its own reporting."""
+    model = SimpleNamespace(modules=lambda: [_floor_gdn(512, 1536)])
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda module: True)
+
+    with caplog.at_level(logging.WARNING):
+        ane_patch._warn_gdn_below_floor(model, True, 0, 0.45, True)
+        ane_patch._warn_gdn_below_floor(model, False, 0, 0.15, True)
+        ane_patch._warn_gdn_below_floor(model, True, 12, 0.15, True)
+
+    assert "floor" not in caplog.text
+
+
+def test_tuner_floor_delegates_to_the_patch_rule():
+    """One implementation of the bank rule, so the tuner grid clamp and the
+    enable-path warning cannot disagree."""
+    from omlx.admin import ane_tuning
+    from omlx.patches import qwen35_ane_prefill as patch
+
+    gdn = _floor_gdn(512, 1536)
+    assert ane_tuning._min_viable_gdn_fraction(
+        patch, gdn, 128
+    ) == patch._min_viable_gdn_fraction(gdn, 128)

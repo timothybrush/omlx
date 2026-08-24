@@ -162,6 +162,14 @@ std::string error_text(NSString *prefix, NSError *error);
 constexpr std::chrono::milliseconds kAneCacheLockTimeout{30000};
 constexpr std::chrono::milliseconds kAneCacheLockRetry{50};
 
+// One stable rendezvous file per cache entry, beside the entry directory.
+// Never unlink this path while the process is running: a waiter may already
+// hold the old inode open, and recreating the path would let a later process
+// lock a different inode and enter the same staging directory concurrently.
+NSString *ane_compile_cache_lock_path(NSString *entry_directory) {
+  return [entry_directory stringByAppendingString:@".lock"];
+}
+
 class ScopedAneCacheLock {
 public:
   explicit ScopedAneCacheLock(NSString *entry_directory) {
@@ -175,7 +183,7 @@ public:
       throw std::runtime_error(
           error_text(@"ANE compile cache parent creation failed", error));
     }
-    NSString *lock_path = [entry_directory stringByAppendingString:@".lock"];
+    NSString *lock_path = ane_compile_cache_lock_path(entry_directory);
     fd_ = open(lock_path.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
     if (fd_ < 0) {
       throw std::runtime_error("ANE compile cache lock open failed.");
@@ -226,13 +234,26 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
   // Resolve before the prefix check: a symlink under the cache root could
   // otherwise redirect the delete outside it while the textual prefix still
   // matched. The resolved path is what removeItemAtPath: will actually touch.
+  NSString *root = ane_compile_cache_root_directory();
   NSString *resolved =
       [directory stringByResolvingSymlinksInPath];
-  NSString *cache_root =
-      [ane_compile_cache_root_directory() stringByResolvingSymlinksInPath];
+  NSString *cache_root = [root stringByResolvingSymlinksInPath];
   NSString *cache_prefix = [cache_root stringByAppendingString:@"/"];
-  if (!ane_compile_cache_enabled() ||
-      ![resolved hasPrefix:cache_prefix]) {
+  if (![resolved hasPrefix:cache_prefix]) {
+    if ([directory hasPrefix:[root stringByAppendingString:@"/"]]) {
+      // A path that sits under the cache root but resolves outside it is not
+      // ours to delete: following it would take the delete somewhere this
+      // process never staged anything. The temp-directory path below is a
+      // different case, it never claimed to be a cache entry.
+      NSLog(@"oMLX: ANE compile cache cleanup skipped, %@ resolves outside "
+            @"the cache root",
+            directory);
+      return;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    return;
+  }
+  if (!ane_compile_cache_enabled()) {
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
     return;
   }
@@ -1339,6 +1360,12 @@ public:
   // The producer command buffer is released mid-dispatch once packing has
   // completed; tell the guard so it does not double-release on unwind.
   void producer_released() { producer_buffer_ = nullptr; }
+  // Transfer one ticket only after its detached evaluation thread exists.
+  // Keeping ownership per ticket lets a later thread-constructor failure
+  // cancel the tickets that have not acquired a worker yet without racing
+  // workers that are already running.
+  void transfer_ticket0() noexcept { model0_.reset(); }
+  void transfer_ticket1() noexcept { model1_.reset(); }
   void disarm() { armed_ = false; }
   ~AneDispatchGuard() {
     if (!armed_) {
@@ -2727,9 +2754,6 @@ public:
 
     auto model0 = model0_;
     auto model1 = model1_;
-    // The evaluation threads below take ownership of the tickets; the qmm
-    // get_kernel window that could orphan them is now behind us.
-    ane_guard.disarm();
     std::thread([model0, ticket0, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model0->execute(ticket0);
@@ -2739,6 +2763,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     std::thread([model1, ticket1, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model1->execute(ticket1);
@@ -2748,6 +2773,8 @@ public:
         profile_add(profile_category, kAne1EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket1();
+    ane_guard.disarm();
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -3090,9 +3117,6 @@ public:
     [suffix_buffer retain];
     encoder.commit();
     auto model = model_;
-    // The evaluation threads below take ownership of the tickets; the
-    // get_kernel window that could orphan them is now behind us.
-    ane_guard.disarm();
     std::thread([model = std::move(model), ticket, profiling, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model->execute(ticket);
@@ -3102,6 +3126,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     if (model1_) {
       auto model1 = model1_;
       std::thread([model1 = std::move(model1), ticket1, profiling, launch] {
@@ -3113,7 +3138,9 @@ public:
           profile_add(profile_category, kAne1EvalNs, end - start);
         }
       }).detach();
+      ane_guard.transfer_ticket1();
     }
+    ane_guard.disarm();
     try {
       if (cpu_fp16_) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
