@@ -2723,22 +2723,29 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        """Return the wide-prefill floor for Qwen hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith("qwen3_5"):
+            is_qwen35 = model_type.startswith("qwen3_5")
+            is_qwen4 = model_type.startswith("qwen4_exp")
+            if is_qwen4:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
-                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
-                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
-                    # where wider prefill regresses throughput (#2880).
+                    # Qwen4 needs its sparse native path before wider chunks
+                    # are safe. NAX/M5 stays at 2048 for both model families.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
@@ -8229,6 +8236,32 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # Lightning-MTP has a small prompt-history cache separate from the
+        # backbone KV restored above.  Bind an exact full-block sidecar (when
+        # one exists) to this singleton timeline before any uncached suffix is
+        # forwarded.  The hook is intentionally best-effort/fail-closed:
+        # ordinary inference and prefix reuse stay valid if MTP is disabled,
+        # the sidecar was evicted, or this model family does not support it.
+        try:
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            prompt_priming.prepare_prefix_context(
+                self.model,
+                request_id=request.request_id,
+                prompt_tokens=request.prompt_token_ids,
+                cached_tokens=request.cached_tokens,
+                prefix_cache=self.block_aware_cache,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            )
+        except Exception as exc:
+            logger.debug(
+                "MTP prefix-history preparation failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
@@ -11480,6 +11513,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear UID mappings
         _unregister_uid_rows_for_model(self.model)
@@ -12239,6 +12274,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear detokenizers
         self._request_detokenizers.clear()
