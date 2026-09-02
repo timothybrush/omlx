@@ -3437,17 +3437,6 @@ class Scheduler:
         existing_cache: list[Any] | None,
         vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
     ) -> tuple[list[Any], list[int]]:
-        return self._do_external_prefill_impl(
-            request, tokens, existing_cache, vlm_embeds
-        )
-
-    def _do_external_prefill_impl(
-        self,
-        request: "Request",
-        tokens: list[int],
-        existing_cache: list[Any] | None,
-        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
-    ) -> tuple[list[Any], list[int]]:
         """Run prefill externally (outside BatchGenerator) for a single request.
 
         Processes tokens[0:N-1] through the model. The last token tokens[N-1]
@@ -3540,9 +3529,18 @@ class Scheduler:
         extra_kwargs: dict[str, Any] | None = None
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
-            embeds_array = embeds_array[:, start_offset:]  # skip cached portion
-            if start_offset > 0 and extra_kwargs:
-                extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
+            # Build the restored-prefix views on the engine stream. A
+            # worker-default-stream slice here sits at the head of the chunk
+            # graph, so MLX bridges it with a cross-stream fence whose
+            # producer buffer is only committed at the end of the eval. The
+            # Qwen ANE prefill primitive commits and waits on the engine
+            # stream buffer mid-eval, so that fence can never be satisfied
+            # and the driver times the buffer out (#3305). Fresh prefills
+            # never hit this: a full-range slice is a no-op in MLX.
+            with mx.stream(self._stream):
+                embeds_array = embeds_array[:, start_offset:]  # skip cached portion
+                if start_offset > 0 and extra_kwargs:
+                    extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
             # Force _position_ids path in language model for cached VLM
             # prefill. Without this, the delta approach gives sequential
             # positions to image tokens that need 3D mRoPE positions.
@@ -3909,21 +3907,6 @@ class Scheduler:
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
-    def _estimate_chunk_transient_bytes(
-        self, n_tokens: int, kv_len: int, *, gathered_core: bool
-    ) -> int:
-        """Call the monitor with an explicit gathered_core flag.
-
-        Test doubles often still take ``(n_tokens, kv_len)`` only.
-        """
-        estimate = self.memory_monitor.estimate_chunk_transient_bytes
-        try:
-            return int(
-                estimate(n_tokens, kv_len, gathered_core=gathered_core)
-            )
-        except TypeError:
-            return int(estimate(n_tokens, kv_len))
-
     def _predicted_chunk_transient(
         self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
     ) -> float:
@@ -3948,8 +3931,10 @@ class Scheduler:
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
         if self.memory_monitor is not None:
-            static = self._estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens, gathered_core=gathered_core
+            static = self.memory_monitor.estimate_chunk_transient_bytes(
+                n_tokens,
+                kv_len + n_tokens,
+                gathered_core=gathered_core,
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
