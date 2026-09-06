@@ -611,6 +611,163 @@ class TestSchedulerAddRequest:
             "req-rotating"
         )
 
+    def test_partial_hit_refused_when_model_builds_unregistered_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Reject unknown cache classes before a partial hit loses their state."""
+        from omlx.cache.paged_cache import BlockTable
+
+        RingSlidingKVCache = type("RingSlidingKVCache", (), {})
+        mock_model.make_cache = lambda: [RingSlidingKVCache()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        # Partial hit: 2 of 4 tokens cached, so the exact-hit guard cannot fire.
+        block_table = BlockTable(request_id="req-ring", block_ids=[7], num_tokens=2)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [43, 44])
+        # Reconstruction hands back a plain KVCache — the ring class is lost.
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-ring",
+            prompt=[41, 42, 43, 44],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [41, 42, 43, 44]
+        assert request.prompt_cache is None
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+
+    def test_plain_kvcache_model_still_uses_prefix_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """The guard must not disable prefix reuse for ordinary KVCache models."""
+        from omlx.cache.paged_cache import BlockTable
+
+        KVCache = type("KVCache", (), {})
+        mock_model.make_cache = lambda: [KVCache()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-plain", block_ids=[8], num_tokens=2)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [53, 54])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-plain",
+            prompt=[51, 52, 53, 54],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+        assert request.cached_tokens == 2
+
+    @pytest.mark.parametrize(
+        "cache_class_name",
+        [
+            # Registered: reconstruction re-dispatches on the stored class name
+            # and the boundary-snapshot path preserves the extra state.
+            "RotatingKVCache",
+            "ArraysCache",
+            "MiniMaxM3KVCache",
+            # Plainly sliceable, round-trips by block slicing.
+            "ChunkedKVCache",
+            "TurboQuantKVCache",
+        ],
+    )
+    def test_supported_non_plain_cache_models_keep_prefix_cache(
+        self, mock_model, mock_tokenizer, cache_class_name
+    ):
+        """Known non-plain cache classes must retain prefix reuse."""
+        from omlx.cache.paged_cache import BlockTable
+
+        mock_model.make_cache = lambda: [type(cache_class_name, (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(
+            request_id="req-supported", block_ids=[11], num_tokens=2
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [63, 64])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-supported",
+            prompt=[61, 62, 63, 64],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+
+    def test_cache_list_refused_when_a_sub_cache_is_unregistered(
+        self, mock_model, mock_tokenizer
+    ):
+        """CacheList round-trips per sub-cache, so one unknown sub-cache is fatal."""
+        cache_list = type(
+            "CacheList",
+            (),
+            {"caches": (type("KVCache", (), {})(), type("RingSlidingKVCache", (), {})())},
+        )
+        mock_model.make_cache = lambda: [cache_list()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+
+    def test_cache_list_allowed_when_every_sub_cache_is_supported(
+        self, mock_model, mock_tokenizer
+    ):
+        """A CacheList of known sub-caches keeps prefix reuse."""
+        cache_list = type(
+            "CacheList",
+            (),
+            {"caches": (type("KVCache", (), {})(), type("RotatingKVCache", (), {})())},
+        )
+        mock_model.make_cache = lambda: [cache_list()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+
+    def test_probe_failure_refuses_reuse_and_is_not_memoized(
+        self, mock_model, mock_tokenizer
+    ):
+        """Refuse reuse on probe failure and retry after recovery."""
+
+        def _boom():
+            raise RuntimeError("cannot build cache")
+
+        mock_model.make_cache = _boom
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+        assert getattr(scheduler, "_unreconstructible_cache_model", None) is None
+
+        # Once the underlying cause clears, the model is probed again.
+        mock_model.make_cache = lambda: [type("KVCache", (), {})()]
+        assert scheduler._model_has_unreconstructible_cache() is False
+
     def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
         self, mock_model, mock_tokenizer
     ):
@@ -6138,6 +6295,44 @@ class TestVLMPositionStateClearing:
         model.clear_vlm_position_state.assert_called_once()
         seed_mrope.assert_called_once_with(model, request)
 
+    def test_vlm_external_prefill_never_slices_embeds_longer_than_tokens(
+        self, mock_tokenizer
+    ):
+        """An oversized chunk must keep token and embedding slice lengths equal."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=4),
+            stream=mx.new_stream(mx.cpu),
+        )
+        # Floor-always throttle stubs: mimics the throttle state that
+        # inflates every chunk to the min-chunk floor.
+        scheduler._adaptive_chunk_size = lambda requested, **kw: 256
+        scheduler._guard_prefill_chunk = lambda n_tokens, **kw: n_tokens
+
+        request = Request(
+            request_id="vlm-tail-chunk",
+            prompt="image prompt",
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        embeds = mx.zeros((1, 10, 4), dtype=mx.float32)
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=request.prompt_token_ids,
+            existing_cache=[],
+            vlm_embeds=(embeds, {}, 0),
+        )
+
+        assert model.call_count > 0
+        for model_call in model.call_args_list:
+            input_ids = model_call.args[0]
+            inputs_embeds = model_call.kwargs["inputs_embeds"]
+            assert inputs_embeds.shape[1] == input_ids.shape[1]
+
 
 class TestBuildStateMachineStopStrings:
     """Tests for _build_state_machine stop-string tokenization.
@@ -6805,3 +7000,39 @@ class TestHybridDecodeKvEvalDefault:
             model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
         )
         assert scheduler._decode_eval_kv_cache_interval == 0
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_unsupported_cache_skips_boundary_storage(mock_model, mock_tokenizer, phase):
+    from mlx_lm.models.cache import KVCache
+
+    class UnknownKVCache(KVCache):
+        pass
+
+    mock_model.make_cache = lambda: [UnknownKVCache()]
+    scheduler = Scheduler(
+        mock_model, mock_tokenizer, SchedulerConfig(paged_cache_block_size=4)
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._boundary_snapshot_store = MagicMock()
+    request = Request("unsupported", [1, 2, 3, 4], SamplingParams())
+    scheduler.add_request(request)
+    with (
+        patch.object(scheduler, "_extract_boundary_snapshot") as extract,
+        patch.object(scheduler, "_prefill_snapshot_value") as materialize,
+    ):
+        if phase == "prefill":
+            scheduler._on_prefill_boundary_snapshot(
+                request.request_id, mock_model.make_cache(), 4
+            )
+        else:
+            scheduler._maybe_capture_boundary_snapshot(request, 0)
+    extract.assert_not_called()
+    materialize.assert_not_called()
+    assert not scheduler._boundary_snapshot_store.mock_calls
+    assert request.request_id not in scheduler._boundary_cache_snapshots
+
+
+def test_mock_cache_has_no_implicit_reconstruction_support(mock_model, mock_tokenizer):
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    assert not scheduler._cache_layer_is_reconstructible(MagicMock())
