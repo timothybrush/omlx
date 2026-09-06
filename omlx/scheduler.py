@@ -51,13 +51,13 @@ from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .decode_activity import get_decode_activity
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
 from .patches.sdpa256_attention import set_unfused_headroom_provider
-from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -2004,12 +2004,6 @@ class Scheduler:
         # and taken after the first prefill chunk's eval.
         self._fixed_state_measure_armed: bool = False
         self._fixed_state_recorded: bool = False
-        # Let the sdpa256 head_dim-256 prefill route ask for live guard
-        # headroom so it only forces bounded native SDPA when the faster
-        # unfused default would not fit (issue #2204). Weakly held; harmless
-        # when the patch is never applied.
-        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
-
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
         self._draft_paged_ssd_cache_manager: Any | None = None
@@ -6554,15 +6548,10 @@ class Scheduler:
         request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
+        *,
+        source: str = "prefill",
     ) -> None:
-        """Record boundary snapshots captured during prefill processing.
-
-        Called from ``_emit_prefill_boundary_snapshot`` at each block
-        boundary crossed during prefill. Keyed by ``request_id`` rather
-        than ``uid`` because the request has not been inserted into
-        ``BatchGenerator`` yet and the uid mapping does not exist —
-        routing through it dropped every snapshot silently (#TBD).
-        """
+        """Record a prefill boundary or a verified terminal response snapshot."""
         if self._model_has_unreconstructible_cache():
             return
 
@@ -6572,7 +6561,7 @@ class Scheduler:
             request_id=request_id,
             token_count=token_count,
             block_size=block_size,
-            source="prefill",
+            source=source,
         )
         if self.block_aware_cache is None:
             self._boundary_snapshot_diagnostics.record(
@@ -6581,7 +6570,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6592,7 +6581,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6603,7 +6592,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6618,7 +6607,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6649,7 +6638,7 @@ class Scheduler:
                     request_id=request_id,
                     token_count=token_count,
                     block_size=block_size,
-                    source="prefill",
+                    source=source,
                     storage="memory",
                 )
                 self._boundary_cache_snapshots[request_id][token_count] = (
@@ -6679,11 +6668,12 @@ class Scheduler:
             request_id=request_id,
             token_count=token_count,
             block_size=block_size,
-            source="prefill",
+            source=source,
             storage=storage,
         )
         logger.debug(
-            "Captured prefill boundary cache snapshot for %s at %s tokens (%s)",
+            "Captured %s boundary cache snapshot for %s at %s tokens (%s)",
+            source,
             request_id,
             token_count,
             storage,
@@ -7498,6 +7488,42 @@ class Scheduler:
             )
             return None
 
+    def _capture_finished_boundary_snapshot(
+        self, request: Request, cache: list[Any]
+    ) -> None:
+        """Preserve a verified terminal boundary after the generator drops its UID."""
+        if getattr(request, "skip_cache_store", False):
+            return
+        if self._boundary_cache_snapshots.get(request.request_id):
+            return
+        token_count = (
+            len(request.prompt_token_ids)
+            if request.needs_think_prefix
+            else request.num_tokens
+        )
+        block_size = self.config.paged_cache_block_size
+        if (
+            block_size <= 0
+            or token_count <= 0
+            or token_count % block_size
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
+
+        # Composite caches use their leading token-position leaf; later
+        # members may count pooled windows instead. Unknown positions cannot
+        # establish that recurrent state matches the emitted token sequence.
+        offsets = [
+            offset
+            for layer in cache
+            if (offset := _first_leaf_cache_offset(layer)) is not None
+        ]
+        if not offsets or any(offset != token_count for offset in offsets):
+            return
+        self._on_prefill_boundary_snapshot(
+            request.request_id, cache, token_count, source="completion"
+        )
+
     def _prepare_prompt_boundary_cache_store(
         self,
         request_id: str,
@@ -8235,13 +8261,10 @@ class Scheduler:
                 f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
             )
 
-    # A 4K prompt is the smallest standard benchmark/workload where a missed
-    # async store is already a multi-second re-prefill.  DeepSeek V4 boundary
-    # snapshots intentionally retain 3584 of 4096 prompt tokens, and their SSD
-    # write can finish just after the first HTTP response is returned.  Include
-    # this workload class in the non-blocking freshness deferral so an immediate
-    # repeated turn waits for that relevant store instead of racing it.
-    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS = 4096
+    # Wait only for reusable blocks. The store/overlap ratio is a heuristic
+    # limiting waits on large stores that share a small prefix; the timeout
+    # below still bounds slow storage independently of token counts.
+    _CACHE_FRESHNESS_WAIT_MAX_STORE_TO_OVERLAP = 16
     _CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS = 8192
     _CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO = 0.30
     _CACHE_FRESHNESS_WAIT_TIMEOUT_S = 4.0
@@ -8267,8 +8290,7 @@ class Scheduler:
             return None
 
         prompt = request.prompt_token_ids or []
-        if len(prompt) < self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS:
-            return None
+        block = max(1, self.config.paged_cache_block_size)
 
         best_rid: str | None = None
         best_future: concurrent.futures.Future | None = None
@@ -8281,6 +8303,24 @@ class Scheduler:
                 continue
 
             common = self._common_prefix_len(prompt, info.tokens)
+            # Filter before ranking so an ineligible larger store cannot
+            # hide a smaller one whose prefix can actually be reused.
+            restorable = (common // block) * block
+            if restorable == len(prompt):
+                # Match exact-hit generation kickoff in prefix preparation:
+                # GDN sidecars drop the final block; other stateful caches
+                # cannot trim to N-1 and require a full prefill.
+                if self._gdn_split_active():
+                    restorable = max(0, restorable - block)
+                elif self._detect_boundary_snapshot_need():
+                    restorable = 0
+            if restorable < block:
+                continue
+            if (
+                len(info.tokens)
+                > self._CACHE_FRESHNESS_WAIT_MAX_STORE_TO_OVERLAP * restorable
+            ):
+                continue
             if common > best_common:
                 best_rid = rid
                 best_future = future
@@ -11359,6 +11399,9 @@ class Scheduler:
                             if extracted_cache:
                                 request._extracted_cache = extracted_cache
                                 request._model_cache_config = model_cache_config
+                                self._capture_finished_boundary_snapshot(
+                                    request, raw_cache
+                                )
                                 logger.debug(
                                     f"Extracted {len(extracted_cache)} layer states "
                                     f"for request {request_id}"
@@ -12270,6 +12313,11 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
+        # Bind on the thread that runs model forwards. Scheduler construction
+        # can happen on a shared event-loop thread, while every engine executes
+        # steps on its own worker. The setter is idempotent for repeated steps.
+        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
+
         output = SchedulerOutput()
 
         # Publish decode activity for cross-engine prefill fairness (a

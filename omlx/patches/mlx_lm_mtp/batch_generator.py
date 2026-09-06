@@ -3214,7 +3214,16 @@ def _chain_rollback(
         except Exception as exc:
             logger.debug("rollback_speculative_cache failed: %s", exc)
             return False
-    rollback = getattr(model, "mtp_partial_rollback", None)
+    # VLM adapters keep the rollback hook on the inner language model.
+    rollback = None
+    for candidate in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        rollback = getattr(candidate, "mtp_partial_rollback", None)
+        if callable(rollback):
+            break
     if callable(rollback):
         try:
             return bool(rollback(prompt_cache, accepted, num_drafts))
