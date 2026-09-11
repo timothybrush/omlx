@@ -239,6 +239,7 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    deepseek_v41_engram_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -268,6 +269,9 @@ class ModelSettingsRequest(BaseModel):
     # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
     qwen35_oq_a8_enabled: bool | None = None
     qwen35_oq_a8_min_tokens: int | None = None
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool | None = None
+    moe_expert_offload_resident_fraction: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -682,6 +686,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    settings["moe_expert_offload_enabled"] = False
+    settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -757,6 +763,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    settings.moe_expert_offload_enabled = False
+    settings.moe_expert_offload_resident_fraction = 0.25
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2110,6 +2118,34 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     exc_info=True,
                 )
 
+        deepseek_v41_engram_ssd_offload_supported = False
+        deepseek_v41_engram_ssd_offload_forced = False
+        v41_resident_bytes = 0
+        v41_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41":
+            try:
+                from ..patches.deepseek_v41.residency import (
+                    deepseek_v41_residency_estimate,
+                )
+
+                estimate = deepseek_v41_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                deepseek_v41_engram_ssd_offload_supported = estimate.supported
+                deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                v41_resident_bytes = estimate.resident_bytes
+                v41_mmap_bytes = estimate.mmap_bytes
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect DeepSeek V4.1 Engram residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
+
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2165,6 +2201,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
+            "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
+            "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
+            "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2498,6 +2538,13 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "deepseek_v41_engram_ssd_offload" in sent:
+        is_deepseek_v41 = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41"
+        current_settings.deepseek_v41_engram_ssd_offload = bool(
+            request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
+        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2719,6 +2766,15 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    # MoE expert offload settings
+    if "moe_expert_offload_enabled" in sent:
+        current_settings.moe_expert_offload_enabled = (
+            request.moe_expert_offload_enabled or False
+        )
+    if "moe_expert_offload_resident_fraction" in sent:
+        current_settings.moe_expert_offload_resident_fraction = (
+            request.moe_expert_offload_resident_fraction or 0.25
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
