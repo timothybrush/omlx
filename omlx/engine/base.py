@@ -605,6 +605,9 @@ class BaseNonStreamingEngine(ActivityTrackingMixin, ABC):
     support streaming or chat completion interfaces.
     """
 
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        """Receive the enforcer's soft watermark; override when needed."""
+
     @property
     @abstractmethod
     def model_name(self) -> str:
