@@ -180,23 +180,8 @@ def apply() -> bool:
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
-            active = getattr(self, "_omlx_mtp_batch_state", None)
-            if (
-                active is not None
-                and all(not state.queue for state in active.states.values())
-                and not _generation_batch_has_active_mtp(batch)
-            ):
-                # Completed ragged emits leave each UID at its own frontier.
-                # Preserve those histories; only newly admitted UIDs need priming.
-                from . import batched_head
-
-                batched_head.flush(active)
-                return original_extend(self, batch, *args, **kwargs)
-            # The host (self) may have active MTP about to gain a co-runner.
-            # The MTP path never maintains mlx-lm's _next_tokens, so a plain
-            # drop here would leave standard batched decode resuming from a
-            # stale _next_tokens against an MTP-advanced cache. Reconcile
-            # before merge while ownership is still well defined.
+            # Reconcile before adding rows without MTP state so the drained
+            # batch can feed its last tokens without replaying its history.
             if not _reconcile_mtp_batch_to_standard(self):
                 raise RuntimeError(
                     "Lightning MTP could not restore the committed batch cache"
@@ -1355,8 +1340,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         logits = None
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
         for start in range(0, total, step):
-            logits, _, _ = _call_backbone(
-                gen_batch.model, tok_arr[None, start : start + step], new_cache
+            # Committed history needs no per-token speculative rollback states.
+            logits = gen_batch.model(
+                tok_arr[None, start : start + step], cache=new_cache
             )
             if start + step < total:
                 mx.eval(logits)
@@ -1374,9 +1360,6 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
-        # Reconciliation produces committed standard-decoding state. A long
-        # re-prefill is still an armed MTP-managed backbone call, so discard
-        # its speculative snapshots before exposing or merging the cache.
         _clear_rollback(new_cache)
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok

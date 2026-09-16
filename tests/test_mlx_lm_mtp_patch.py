@@ -1759,7 +1759,7 @@ class TestBatchGeneratorDispatch:
     def _make_reconcile_batch(self, monkeypatch, *, uid, tokens, queue_entries):
         """Build a fake singleton batch and stub the heavy backbone/cache calls.
 
-        The fake backbone advances the fake cache offset by the input length and
+        The fake model advances the fake cache offset by the input length and
         returns deterministic logits whose last-position argmax is token id 5.
         """
         from collections import deque
@@ -1779,26 +1779,21 @@ class TestBatchGeneratorDispatch:
         def fake_rebuild(model):
             return [_FakeCache()]
 
-        def fake_backbone(model, inputs, cache, n_confirmed=0):
+        def forward(inputs, cache):
             cache[0].offset = int(inputs.shape[1])
             cache[0]._mtp_undo = object()
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
-            return mx.array(arr), None, None
+            return mx.array(arr)
 
         monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", fake_rebuild)
-        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
-        # ``_get_generation_stream`` was removed in #1304 when the patch
-        # moved stream selection to the enclosing BatchGenerator context.
-        # The fake_backbone / fake_rebuild monkeypatches above bypass the
-        # actual MLX dispatch, so no stream override is needed.
 
         def greedy(lp_2d):
             return mx.argmax(lp_2d, axis=-1).astype(mx.uint32)
 
         state = batch_generator._MtpState(uid=uid, queue=deque(queue_entries))
         batch = SimpleNamespace(
-            model=object(),
+            model=forward,
             uids=[uid],
             tokens=[list(tokens)],
             _num_tokens=[len(tokens)],
@@ -2803,19 +2798,18 @@ class TestReconcileChunked:
                 self.offset = 0
                 self._mtp_undo = None
 
-        def fake_backbone(model, inputs, cache, n_confirmed=0):
+        def forward(inputs, cache):
             shapes.append(int(inputs.shape[1]))
             cache[0].offset += int(inputs.shape[1])
             arr = np.full((1, int(inputs.shape[1]), 8), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0
-            return mx.array(arr), None, None
+            return mx.array(arr)
 
         monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", lambda m: [_FakeCache()])
-        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
         tokens = list(range(1300))
         state = batch_generator._MtpState(uid=1, queue=deque())
         batch = SimpleNamespace(
-            model=object(),
+            model=forward,
             uids=[1],
             tokens=[tokens],
             _num_tokens=[len(tokens)],
@@ -2862,10 +2856,8 @@ class TestReconcileChunked:
 
             def __call__(self, inputs, cache=None, return_hidden=False):
                 logits = super().__call__(inputs, cache=cache)
-                if return_hidden:
-                    self.reconcile_shapes.append(int(inputs.shape[1]))
-                    return logits, None
-                return logits
+                self.reconcile_shapes.append((int(inputs.shape[1]), return_hidden))
+                return (logits, None) if return_hidden else logits
 
         batch_generator.apply()
         model = ProbeModel()
@@ -2886,11 +2878,12 @@ class TestReconcileChunked:
             row = batch_generator._make_row_batch(batch, 0, state=state)
             assert row.prefill_step_size == step
             target = row if queued else batch
+            model.reconcile_shapes.clear()
             assert batch_generator._reconcile_mtp_to_standard(target, state)
             expected = [step] * (len(history) // step)
             if len(history) % step:
                 expected.append(len(history) % step)
-            assert model.reconcile_shapes == expected
+            assert model.reconcile_shapes == [(size, False) for size in expected]
             assert target.tokens[0] == history
 
             reference = batch_generator._rebuild_singleton_cache(model)
@@ -3156,33 +3149,72 @@ def test_late_join_does_not_duplicate_or_skip_tokens():
     assert output[1] == list(range(13, 21))
 
 
-def test_active_batch_admits_new_row_without_rebuilding_old_rows(monkeypatch):
+@pytest.mark.parametrize("unequal_acceptance", [False, True])
+def test_active_batch_admits_new_row_without_rebuilding_old_rows(
+    monkeypatch, unequal_acceptance
+):
+    class DraftModel(CountingModel):
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            if unequal_acceptance:
+                logits = self._logits(tokens + (tokens % 5 == 0))
+                return (
+                    (logits, tokens[..., None].astype(mx.float32))
+                    if return_hidden
+                    else logits
+                )
+            return super().mtp_forward(hidden, tokens, cache, return_hidden, **kwargs)
+
     bg.apply()
-    model = CountingModel()
-    gen = BatchGenerator(
-        model, sampler=lambda lp: mx.argmax(lp, -1), prefill_batch_size=2, max_tokens=24
+    model = DraftModel()
+    prompts = [[1, 2], [10, 11, 12], [20, 21]]
+    limits = [80, 80, 40]
+    output = {uid: [] for uid in range(3)}
+    terminal = {}
+    verified = []
+    original_verify = bg._run_verify_cycle_batched
+
+    def verify(batch, state):
+        verified.append(tuple(batch.uids))
+        return original_verify(batch, state)
+
+    monkeypatch.setattr(bg, "_run_verify_cycle_batched", verify)
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed an existing request's history"),
     )
+    gen = BatchGenerator(
+        model, sampler=lambda lp: mx.argmax(lp, -1), prefill_batch_size=2, max_tokens=80
+    )
+
+    def step():
+        _, responses = gen.next()
+        for response in responses:
+            assert response.uid not in terminal
+            output[response.uid].append(response.token)
+            if response.finish_reason:
+                terminal[response.uid] = response
+
     try:
-        first = gen.insert([[1, 2], [10, 11]])
-        for _ in range(8):
-            gen.next()
-            if (
-                getattr(gen._generation_batch, "_omlx_mtp_batch_state", None)
-                is not None
-            ):
+        first = gen.insert(prompts[:2], max_tokens=limits[:2])
+        for _ in range(12):
+            step()
+            if tuple(first) in verified:
                 break
-        original_states = dict(gen._generation_batch._omlx_mtp_batch_state.states)
-        new_uid = gen.insert([[20, 21]])[0]
-        joined = False
-        for _ in range(6):
-            gen.next()
-            active = gen._generation_batch
-            if new_uid in active.uids:
-                states = active._omlx_mtp_batch_state.states
-                assert all(states[uid] is original_states[uid] for uid in first)
-                joined = True
+        assert tuple(first) in verified
+        new_uid = gen.insert(prompts[2:], max_tokens=limits[2:])[0]
+        for _ in range(120):
+            step()
+            if len(terminal) == 3:
                 break
-        assert joined, "Late join must not wait for the current batch to finish"
+        assert tuple(first + [new_uid]) in verified
+        assert len(terminal) == 3
+        for uid, prompt in enumerate(prompts):
+            expected = [(prompt[-1] + i + 1) % 64 for i in range(limits[uid])]
+            assert output[uid] == expected
+            cache = terminal[uid].prompt_cache[0]
+            cached = cache.keys[0, 0, : cache.offset, 0].tolist()
+            assert cached in (prompt + expected, (prompt + expected)[:-1])
     finally:
         gen.close()
 
@@ -3680,6 +3712,126 @@ def _model(family):
         fixture.close()
         return model
     raise AssertionError(family)
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen_vlm"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_reconcile_matches_ordinary_prefill_cache_and_next_token(family, queued):
+    from collections import deque
+
+    mx.random.seed(3702)
+    model = _model(family)
+    mx.eval(model.parameters())
+    history = [3, 4, 5, 6, 7] * 8
+    step = 16
+    state = bg._MtpState(
+        uid=17,
+        queue=deque([(7, mx.zeros((256,)), "draft")]) if queued else deque(),
+    )
+    batch = SimpleNamespace(
+        model=model,
+        uids=[17],
+        tokens=[history.copy()],
+        _num_tokens=[4],
+        samplers=[None],
+        fallback_sampler=lambda lp: mx.argmax(lp, axis=-1).astype(mx.uint32),
+        logits_processors=[],
+        _next_tokens=mx.array([999]),
+        _next_logprobs=[],
+        _token_context=[],
+        prompt_cache=[object()],
+        prefill_step_size=step,
+    )
+    with bg._prompt_priming.decode_scope(model, batch.uids):
+        assert bg._reconcile_mtp_to_standard(batch, state)
+        reference = bg._rebuild_singleton_cache(model)
+        tokens = mx.array(history, dtype=mx.uint32)
+        for start in range(0, len(history), step):
+            logits = model(tokens[None, start : start + step], cache=reference)
+            mx.eval(logits)
+        for actual, expected in zip(batch.prompt_cache, reference, strict=True):
+            actual_state = tree_flatten(actual.state)
+            expected_state = tree_flatten(expected.state)
+            for (key, value), (ref_key, ref) in zip(
+                actual_state, expected_state, strict=True
+            ):
+                assert key == ref_key
+                if isinstance(value, mx.array):
+                    assert mx.array_equal(value, ref).item(), (family, key)
+                else:
+                    assert value == ref
+            assert actual.meta_state == expected.meta_state
+        expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
+        assert batch._next_tokens.item() == expected_token
+        assert batch.tokens == [history]
+        assert batch._num_tokens == [4]
+        if queued:
+            assert mx.array_equal(batch._next_logprobs[0], state.queue[0][1])
+        else:
+            expected_lp = bg._logprobs(logits[:, -1, :])[0]
+            assert mx.array_equal(batch._next_logprobs[0], expected_lp)
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen_vlm"])
+def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypatch):
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    mx.random.seed(3702)
+    model = _model(family)
+    mx.eval(model.parameters())
+    handoffs = []
+    feed = bg._feed_batch_mains_to_standard
+
+    def checked_feed(batch, state):
+        reference = copy.deepcopy(batch.prompt_cache)
+        inputs = mx.stack([state.states[uid].next_main for uid in batch.uids])
+        bg._set_batched_mrope_deltas(batch, batch.uids)
+        with bg._prompt_priming.decode_scope(batch.model, batch.uids):
+            expected_lp = bg._logprobs(batch.model(inputs, cache=reference)[:, -1, :])
+        result = feed(batch, state)
+        assert result
+        assert mx.array_equal(batch._next_tokens, mx.argmax(expected_lp, axis=-1))
+        assert mx.array_equal(mx.stack(batch._next_logprobs), expected_lp)
+        for actual, expected in zip(batch.prompt_cache, reference, strict=True):
+            for (key, value), (ref_key, ref) in zip(
+                tree_flatten(actual.state), tree_flatten(expected.state), strict=True
+            ):
+                assert key == ref_key
+                if isinstance(value, mx.array):
+                    assert mx.array_equal(value, ref), (family, key)
+                else:
+                    assert value == ref
+            assert actual.meta_state == expected.meta_state
+        handoffs.append(tuple(batch.uids))
+        return result
+
+    monkeypatch.setattr(bg, "_feed_batch_mains_to_standard", checked_feed)
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed an existing request's history"),
+    )
+    bg.apply()
+    gen = BatchGenerator(
+        model, sampler=lambda lp: mx.argmax(lp, -1), prefill_batch_size=2, max_tokens=40
+    )
+    try:
+        first = gen.insert([[3, 4, 5], [7, 8, 9, 10, 11]])
+        for _ in range(12):
+            gen.next()
+            if getattr(gen._generation_batch, "_omlx_mtp_batch_state", None):
+                break
+        assert getattr(gen._generation_batch, "_omlx_mtp_batch_state", None)
+        new_uid = gen.insert([[12, 13, 14, 15]])[0]
+        for _ in range(12):
+            gen.next()
+            active = gen._generation_batch
+            state = getattr(active, "_omlx_mtp_batch_state", None)
+            if state is not None and new_uid in state.states:
+                break
+        assert tuple(first) in handoffs
+        assert state is not None and set(state.states) == set(first + [new_uid])
+    finally:
+        gen.close()
 
 
 @pytest.mark.parametrize(
