@@ -2801,6 +2801,45 @@ class TestStopSafety:
         assert events == ["stop", "vision_cache", "inner_close"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("release_fails", [False, True])
+    async def test_stop_releases_ane_through_adapter_close(self, release_fails):
+        from omlx.models.vlm import VLMModelAdapter
+
+        engine = _make_loaded_engine()
+        model = engine._vlm_model
+        adapter = VLMModelAdapter(model)
+        engine._adapter = adapter
+        events = []
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        inner = MagicMock()
+        engine._engine.engine = inner
+
+        def close():
+            events.append("close")
+            assert engine._vlm_model is None
+            adapter.release_resources()
+
+        inner.close.side_effect = close
+
+        def release(value):
+            events.append("release")
+            assert value is model
+            assert adapter._vlm_model is model
+            if release_fails:
+                raise RuntimeError("native release unavailable")
+            return 3, 6
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=release,
+        ):
+            await engine.stop()
+
+        assert events == ["stop", "close", "release"]
+        assert adapter._vlm_model is None
+        assert engine._engine is None
+
+    @pytest.mark.asyncio
     async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
         """Diffusion workers see cancellation before model refs are cleared."""
         engine = _make_loaded_engine(model_type="diffusion_gemma")
