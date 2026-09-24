@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
+"""Fused GDN prework for Qwen3.5/3.6 verify and selected decode paths.
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -19,8 +19,11 @@ multiply's rounding — the composed chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
-Only the target-verify arm routes here; decode (S=1) and prefill keep the
-stock path.
+This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
+through Qwen3_5GatedDeltaNet on Metal. Gates,
+recurrence, final norm and projections remain unchanged. Other Qwen3.5
+decode shapes and prefill keep the stock path. Qwen4 has its separate
+BF16 decode prework and norm-gate kernels below.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
+_QWEN35_DECODE_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -612,6 +616,42 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
+def _qwen35_decode_eligible(module, inputs, mask, cache) -> bool:
+    """Check the fused kernel shape, precision and cache requirements."""
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
+
+    if (
+        type(module) is not Qwen3_5GatedDeltaNet
+        or module.training
+        or not isinstance(inputs, mx.array)
+        or inputs.shape != (1, 1, module.hidden_size)
+        or inputs.dtype not in (mx.float16, mx.bfloat16)
+        or mx.default_device() != mx.gpu
+        or mask is not None
+        or type(cache) is not ArraysCache
+        or len(cache.cache) != 2
+        or cache.is_speculating
+        or cache.lengths is not None
+        or cache.left_padding is not None
+        or module.head_k_dim != 128
+        or module.head_v_dim != 128
+        or module.conv_kernel_size != 4
+        or module.conv1d.weight.shape != (module.conv_dim, 4, 1)
+        or module.conv1d.weight.dtype != inputs.dtype
+        or getattr(module.conv1d, "bias", None) is not None
+    ):
+        return False
+    return (
+        isinstance(cache[0], mx.array)
+        and cache[0].shape == (1, 3, module.conv_dim)
+        and cache[0].dtype == inputs.dtype
+        and isinstance(cache[1], mx.array)
+        and cache[1].shape == (1, module.num_v_heads, 128, 128)
+        and cache[1].dtype == mx.float32
+    )
+
+
 def _qwen4_l2_norm_sites():
     """Return the (verifier, layer) normalize functions of the loaded qwen4_exp.
 
@@ -648,8 +688,65 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
+    scales = {
+        dtype: (mx.array(128**-1, dtype=dtype), mx.array(128**-0.5, dtype=dtype))
+        for dtype in (mx.float16, mx.bfloat16)
+    }
 
-    def decode(self, inputs, mask=None, cache=None):
+    def decode(self, inputs, mask=None, cache=None, **kwargs):
+        # Runtime extensions (for example capture/verification keywords)
+        # must keep their original implementation and cache semantics.
+        if kwargs:
+            return original(self, inputs, mask=mask, cache=cache, **kwargs)
+        if _qwen35_decode_eligible(self, inputs, mask, cache):
+            mixed_qkv = self.in_proj_qkv(inputs)
+            # The kernel reads projections, convolution weights and state as one dtype.
+            if mixed_qkv.dtype != inputs.dtype or mixed_qkv.shape != (
+                1,
+                1,
+                self.conv_dim,
+            ):
+                return original(self, inputs, mask=mask, cache=cache)
+            z = self.in_proj_z(inputs).reshape(1, 1, self.num_v_heads, self.head_v_dim)
+            b, a = self._project_gates(inputs)
+            q_scale, k_scale = scales[inputs.dtype]
+            q, k, v, conv_state = gdn_prework_fused(
+                mixed_qkv,
+                cache[0],
+                self.conv1d.weight,
+                q_scale,
+                k_scale,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+            # An ordinary ArraysCache has no speculative history to record.
+            # Compute both next states first, then commit them together;
+            # never retry stock code against a partially advanced cache.
+            out, state = q35.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state=cache[1],
+                use_kernel=True,
+            )
+            out = self.norm(out, z)
+            result = self.out_proj(out.reshape(1, 1, -1))
+            cache[0], cache[1] = conv_state, state
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+            global _QWEN35_DECODE_ENGAGED_LOGGED
+            if not _QWEN35_DECODE_ENGAGED_LOGGED:
+                _QWEN35_DECODE_ENGAGED_LOGGED = True
+                logger.info("Qwen B1/T1 fused GDN prework engaged")
+            return result
+
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
             return original(self, inputs, mask=mask, cache=cache)
         mixed_qkv, z, b, a = _target_verify_linears(
