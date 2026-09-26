@@ -2550,6 +2550,17 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
+        # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
+        # two launches instead of five (bit-identical; needs the router patch).
+        try:
+            from ..patches.qwen35_moe_routed_decode import (
+                apply_qwen35_moe_routed_decode_patch,
+            )
+
+            apply_qwen35_moe_routed_decode_patch()
+        except Exception:
+            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
@@ -2776,7 +2787,9 @@ class VLMBatchedEngine(BaseEngine):
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
-        # pass has already run.
+        # pass has already run. Mark unloaded first: the scheduler is no longer
+        # reachable once _engine is cleared.
+        self._loaded = False
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -2801,7 +2814,6 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        self._loaded = False
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
