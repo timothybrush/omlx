@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import sys
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -4148,6 +4149,51 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen35_prefill_floor == 4096
             assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
             assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
+        ("nax_sparse_mla", "memory_gb", "expected"),
+        [(True, 256, 4096), (True, 96, 4096), (True, 48, 0), (False, 256, 0)],
+    )
+    def test_glm5_next_nax_host_prefill_step(
+        self, mock_tokenizer, tmp_path, nax_sparse_mla, memory_gb, expected
+    ):
+        """On NAX hosts GLM-5.3 takes 4096-token chunks (and blocks) when the
+        tensor-unit sparse MLA path is available."""
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch(
+                "omlx.settings.get_system_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = expected or 2048
+            assert scheduler._qwen35_prefill_floor == expected
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
+            assert scheduler.config.paged_cache_block_size == step
         finally:
             scheduler.shutdown()
 

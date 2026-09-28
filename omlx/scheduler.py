@@ -2928,10 +2928,19 @@ class Scheduler:
                     return 0
             if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
+                from .patches.glm_moe_dsa.sparse_mla_nax import (
+                    nax_sparse_mla_available,
+                )
                 from .settings import get_system_memory
 
-                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Keep the default chunk size on NAX hosts.
+                if get_system_memory() < 64 * 1024**3:
+                    return 0
+                if not is_nax_available():
+                    return 4096
+                # NAX hosts keep the default chunk, except GLM-5.3 with the
+                # tensor-unit sparse MLA: its attention cost per query does not
+                # depend on the chunk, so a wider chunk feeds the MoE more rows.
+                if is_glm5_next and nax_sparse_mla_available():
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
