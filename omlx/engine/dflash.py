@@ -36,6 +36,7 @@ from ..memory_monitor import (
     set_model_info_from_model,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..scheduler import _glm5_next_prefill_floor
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -94,7 +95,7 @@ def _get_dflash_stop_token_ids(
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.8 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    DFlash 0.1.10+omlx.9 registers QwenGdnTargetOps, Gemma4TargetOps, and
     MuseGlimmerTargetOps; oMLX adds Laguna, MiMo V2, and GLM-5.3 target/draft
     adapters. The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
@@ -272,18 +273,12 @@ def check_draft_target_precision_pairing(
 def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
     """Cold-prefill chunk for a target adapter that chunks prefill itself.
 
-    GLM-5.3 follows the batched scheduler's NAX prefill floor when that
-    exists (wider chunks once the tensor-unit sparse MLA makes the attention
-    cost chunk-independent), so DFlash prefill runs the same chunks as the
-    batched engine.
+    GLM-5.3 follows the batched scheduler's prefill floor, so DFlash prefill
+    runs the same chunks as the batched engine.
     """
     step = int(runtime_step or 0)
     if getattr(target_ops, "backend_name", "") == "glm5_next":
-        try:
-            from ..scheduler import _glm5_next_nax_prefill_step
-        except ImportError:
-            return step
-        step = max(step, int(_glm5_next_nax_prefill_step() or 0))
+        step = max(step, _glm5_next_prefill_floor())
     return step
 
 
