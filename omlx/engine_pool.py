@@ -302,7 +302,7 @@ class EngineEntry:
         | TTSEngine
         | None
     ) = None  # Loaded engine instance
-    last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
+    last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
     is_loading: bool = False  # Prevent concurrent loads
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
@@ -425,7 +425,7 @@ class EnginePool:
                 # Generation steps already keep the GPU busy.
                 self._gpu_keep_warm_last_active = now
                 return False
-            # last_access marks request start; long requests are caught above.
+            # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
         return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
 
@@ -2419,11 +2419,13 @@ class EnginePool:
         if entry is not None and not entry.pending_unload_reason:
             if entry.in_use > 0:
                 entry.in_use -= 1
+                entry.last_access = time.time()
             return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+                e.last_access = time.time()
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
@@ -3126,21 +3128,8 @@ class EnginePool:
                 and actual_freed > 0
                 and not footprint_pending
             ):
-                # This unload released memory, stopped short of the bar, and
-                # the gauge has not moved since. The remaining rounds only
-                # repeat gc/synchronize/clear_cache against a number that is
-                # not changing, so they cannot settle the barrier — burn them
-                # and the 3s emergency reclaim for nothing (#2757: ~10s
-                # shutdown hang on a model that plateaus just short).
-                #
-                # Scoped deliberately:
-                #  - actual_freed > 0 means memory *was* returned and merely
-                #    fell short. A constant 0 is a different situation, left
-                #    to run the full barrier and its emergency reclaim.
-                #  - not footprint_pending, because a flat MLX gauge with the
-                #    phys footprint ledger still lagging is exactly what the
-                #    barrier exists to wait out; bailing there is what causes
-                #    the 507 on an immediate settings reload.
+                # A non-zero plateau means gc/clear_cache stopped releasing
+                # memory. A zero plateau still gets the full barrier.
                 settle_stalled = True
                 logger.info(
                     f"Settle for '{model_id}' stalled at "
@@ -3183,13 +3172,7 @@ class EnginePool:
             # get_engine), so any unreleased memory stays visible to both.
             pass
         elif settle_stalled:
-            # The barrier gave up early because the gauge stopped moving
-            # (logged above). Emergency reclaim is skipped for the same
-            # reason it is skipped above, and more directly here: it is three
-            # more gc + synchronize + clear_cache rounds, which is precisely
-            # the work that just proved it releases nothing. Recovery relies
-            # on the same two safety nets — the enforcer re-poll woken below
-            # and the live gauge re-read at pre-load admission.
+            # Emergency reclaim repeats the gc/clear_cache work that just stalled.
             pass
         else:
             # Barrier timed out - try emergency reclaim
@@ -3453,22 +3436,10 @@ class EnginePool:
                             f"Falling back to default engine."
                         )
                 elif dflash_enabled:
-                    # dflash_enabled but no draft could be resolved: no
-                    # bundled auto-detection exists for this checkpoint
-                    # family (only MiMo has one, via
-                    # resolve_bundled_mimo_draft) and dflash_draft_model
-                    # was left unset. Every other branch above logs why
-                    # DFlash isn't active; this one silently fell through
-                    # to the default engine with no signal at all, which
-                    # is exactly what makes a stale dflash_enabled=true
-                    # (e.g. carried over from a settings migration or a
-                    # recipe import) look identical to a healthy load.
                     logger.warning(
-                        "DFlash enabled for %s but no draft model could be "
-                        "resolved (dflash_draft_model is unset and no "
-                        "bundled draft was found for this checkpoint "
-                        "family); loading without DFlash acceleration. Set "
-                        "dflash_draft_model explicitly to enable it.",
+                        "DFlash enabled for %s but no draft model is set; "
+                        "loading without DFlash. Set dflash_draft_model to "
+                        "enable it.",
                         model_id,
                     )
 
