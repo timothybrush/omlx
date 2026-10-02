@@ -6887,9 +6887,16 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
+        # Bare grammars constrain the answer from its first token. Forcing a
+        # thinking close into them can leave every logit masked to -inf. Only
+        # grammars compiled with a separate reasoning phase can use a budget.
+        grammar_allows_thinking = sampling_params.compiled_grammar is None or (
+            getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
+            is True
+        )
         if (
-            sampling_params.thinking_budget is not None
+            grammar_allows_thinking
+            and sampling_params.thinking_budget is not None
             and request is not None
             and (
                 getattr(request, "needs_think_prefix", False)
@@ -6924,9 +6931,8 @@ class Scheduler:
                 logits_processors.append(processor)
 
         # Add grammar constraint processor for structured output.
-        # Phase awareness (thinking vs output) is handled by the compiled
-        # grammar itself via xgrammar structural tags, so we don't need
-        # think_end_ids here.
+        # Reasoning-aware grammars handle thinking/output phases through
+        # structural tags; bare grammars constrain output immediately.
         if sampling_params.compiled_grammar is not None:
             try:
                 from .api.grammar import GrammarConstraintProcessor
@@ -10822,6 +10828,7 @@ class Scheduler:
         # failed_ids excludes _inflight_store_futures ids, so snapshots the
         # async store worker still reads are left intact.
         for rid in failed_ids:
+            self._cleanup_specprefill(rid)
             self._drop_boundary_snapshots_for_request(rid)
             self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
@@ -11490,6 +11497,8 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+                # Indices were scored against the rejected cache's cached_tokens.
+                request.specprefill_indices = None
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
@@ -12955,6 +12964,10 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         # Clear stale VLM position state to prevent re-corruption on retry
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -13033,6 +13046,8 @@ class Scheduler:
         request._extracted_cache = None
         request._model_cache_config = None
         request.think_prefix_sent = False
+        # Indices were scored against the pre-reset cached_tokens.
+        request.specprefill_indices = None
 
     def _collect_corruption_retry_requests(self) -> list[Request]:
         """Every live request that must be re-prefilled after a cache reset.
