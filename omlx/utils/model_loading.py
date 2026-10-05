@@ -940,13 +940,25 @@ def maybe_apply_pre_load_patches(
                 backend = (
                     "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
                 )
-                logger.info(
-                    "Speculative backend selected for %s: %s "
-                    "(model_type=%s, active)",
-                    model_name,
-                    backend,
-                    model_type,
-                )
+                # DSpark is declared in config only, so only Lightning MTP is probed.
+                if backend == "Lightning MTP" and not _checkpoint_has_mtp_weights(
+                    model_name
+                ):
+                    logger.warning(
+                        "Lightning MTP is inactive for %s (model_type=%s): the "
+                        "config declares MTP heads but the checkpoint has no MTP "
+                        "weights",
+                        model_name,
+                        model_type,
+                    )
+                else:
+                    logger.info(
+                        "Speculative backend selected for %s: %s "
+                        "(model_type=%s, active)",
+                        model_name,
+                        backend,
+                        model_type,
+                    )
             else:
                 logger.debug(
                     "Native MTP patch applied for %s for sanitize correctness "

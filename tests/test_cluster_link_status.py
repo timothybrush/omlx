@@ -17,6 +17,7 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _rdma_port_state,
     _run_link_command,
     assess_link,
     classify_link,
@@ -800,6 +801,16 @@ def test_remote_link_probe_reaches_the_peer_shell_intact(monkeypatch):
 
     assert seen[0][0] == "ssh"
     assert shlex.split(seen[0][-1]) == list(command)
+
+
+def test_rdma_port_probe_names_the_link_when_it_times_out(monkeypatch):
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("omlx.cluster.transport.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Thunderbolt link is most likely down"):
+        _rdma_port_state("Studio.local", "rdma_en2")
 
 
 def test_link_verification_rejects_a_route_on_the_wrong_interface():

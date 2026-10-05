@@ -42,7 +42,7 @@ python -m pytest                      # Excludes slow and integration tests
 
 See [TESTING.md](TESTING.md) for additional checks. For inference or cache changes, include a representative real-model check when possible, covering affected features such as prefix reuse, streaming, or concurrent requests. State what you ran and what remains untested; CI or mocked tests do not replace hardware validation.
 
-For visible UI changes, include screenshots and check the actual screen. Run relevant JavaScript tests and build the macOS app when those components change. After editing admin templates or JavaScript, rebuild CSS:
+UI and UX changes, in the admin dashboard or the macOS app, must include before and after screenshots of the actual screen in the PR description. Use a short screen recording when the change is about interaction. UI PRs are reviewed once screenshots are attached. Run relevant JavaScript tests and build the macOS app when those components change. After editing admin templates or JavaScript, rebuild CSS:
 
 ```bash
 python omlx/admin/build_css.py

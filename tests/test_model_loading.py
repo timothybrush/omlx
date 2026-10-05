@@ -2,6 +2,7 @@
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
 import json
+import logging
 import sys
 import types
 from unittest.mock import MagicMock
@@ -662,6 +663,35 @@ class TestVlmMtpPreLoadDispatch:
         sanitize_mock.assert_not_called()
         runtime_mock.assert_not_called()
         assert calls == []
+
+
+class TestSpeculativeBackendLog:
+    @staticmethod
+    def _load(tmp_path, monkeypatch, *, has_mtp: bool) -> None:
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        stub = MagicMock(apply_mlx_lm_mtp_patch=MagicMock(return_value=True))
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", stub)
+        path = _write_config(
+            tmp_path, '{"model_type": "qwen3_5", "num_nextn_predict_layers": 1}'
+        )
+        _write_mtp_index(tmp_path, has_mtp=has_mtp)
+        maybe_apply_pre_load_patches(
+            path, model_settings=types.SimpleNamespace(mtp_enabled=True)
+        )
+
+    def test_missing_mtp_weights_logs_inactive(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            self._load(tmp_path, monkeypatch, has_mtp=False)
+
+        assert "Lightning MTP is inactive" in caplog.text
+        assert "Speculative backend selected" not in caplog.text
+
+    def test_mtp_weights_present_logs_active(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            self._load(tmp_path, monkeypatch, has_mtp=True)
+
+        assert "Speculative backend selected" in caplog.text
+        assert "inactive" not in caplog.text
 
 
 class TestCheckpointHasMtpWeights:
