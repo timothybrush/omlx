@@ -31,7 +31,14 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -287,6 +294,14 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+def _draft_path_is_unusable(value: str) -> bool:
+    path = Path(value).expanduser()
+    # Match local references without resolving or downloading HF repo IDs.
+    return (
+        path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+    ) and not (path / "config.json").is_file()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -431,14 +446,11 @@ class ModelSettingsRequest(BaseModel):
         "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
     )
     @classmethod
-    def validate_draft_path(cls, value: str | None) -> str | None:
+    def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
         if not value:
             return None
-        path = Path(value).expanduser()
-        # Match local references without resolving or downloading HF repo IDs.
-        if (
-            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
-        ) and not (path / "config.json").is_file():
+        # A DFlash draft may stay parked while DFlash is off; the route checks it.
+        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
 
@@ -2798,6 +2810,7 @@ async def update_model_settings(
             "audio_stt",
             "audio_tts",
             "audio_sts",
+            "decision",
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
@@ -2816,6 +2829,7 @@ async def update_model_settings(
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
+            "decision": "decision",
         }
         if override_value:
             entry.model_type = override_value
@@ -3187,6 +3201,16 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    draft_model = current_settings.dflash_draft_model
+    if (
+        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
+        and current_settings.dflash_enabled
+        and draft_model
+        and _draft_path_is_unusable(draft_model)
+    ):
+        raise HTTPException(
+            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:

@@ -2389,9 +2389,12 @@ class PagedSSDCacheManager(CacheManager):
         # SSD budget. Converge immediately before serving requests.
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
+            tracked_count = self._tracked_ssd_count()
             self._enforce_size_limit_for_new_block(0, unbounded=True)
-            logger.info(
-                "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
+            logger.warning(
+                "SSD cache startup cleanup: evicted=%d, freed=%s, remaining=%s, "
+                "limit=%s",
+                tracked_count - self._tracked_ssd_count(),
                 format_bytes(tracked_size - self._tracked_ssd_size()),
                 format_bytes(self._tracked_ssd_size()),
                 format_bytes(self._get_effective_max_size()),
