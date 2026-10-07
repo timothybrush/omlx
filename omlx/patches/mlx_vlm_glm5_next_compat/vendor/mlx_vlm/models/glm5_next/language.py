@@ -1562,34 +1562,16 @@ class Glm5NextMoEGate(nn.Module):
         if (
             _DECODE_FUSION
             and x.ndim == 3
-            and x.shape[:2] == (1, 1)
-            and self.n_group == 1
-        ):
-            # One token: the reference logits come from the one-row fp32
-            # gemv, which the fused router reproduces (multi-row calls use
-            # a different matmul and keep the reference path).
-            routed = _decode_kernels.moe_router(
-                x.reshape(1, -1),
-                self.weight,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-            )
-            if routed is not None:
-                indices, scores = routed
-                return indices.reshape(1, 1, -1), scores.reshape(1, 1, -1)
-        if (
-            _DECODE_FUSION
-            and x.ndim == 3
             and x.shape[0] == 1
-            and 2 <= x.shape[1] <= _DECODE_BLOCK
+            and 1 <= x.shape[1] <= _DECODE_BLOCK
             and self.n_group == 1
         ):
-            # Verify block: the reference logits come from MLX's NAX split-K
-            # GEMM, which moe_router_rows reproduces op for op.
-            routed = _decode_kernels.moe_router_rows(
-                x.reshape(x.shape[1], -1),
+            # Every row uses the one-token fp32 gemv arithmetic, so verify
+            # rows route like their decode steps. The stock block GEMM uses
+            # TF32 on NAX and can pick other experts.
+            rows = x.shape[1]
+            routed = _decode_kernels.moe_router(
+                x.reshape(rows, -1),
                 self.weight,
                 self.e_score_correction_bias,
                 self.top_k,
@@ -1598,7 +1580,7 @@ class Glm5NextMoEGate(nn.Module):
             )
             if routed is not None:
                 indices, scores = routed
-                return indices.reshape(1, x.shape[1], -1), scores.reshape(1, x.shape[1], -1)
+                return indices.reshape(1, rows, -1), scores.reshape(1, rows, -1)
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         return group_expert_select(
             logits,
