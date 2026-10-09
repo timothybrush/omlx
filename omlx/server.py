@@ -212,6 +212,7 @@ from .exceptions import (
     ModelUnavailableError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestAbortedError,
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
@@ -520,12 +521,7 @@ async def lifespan(app: FastAPI):
     # Advertise this oMLX instance so another Mac can identify it by hostname
     # and API port without asking the user to type an SSH target. Publication
     # is best-effort: inference remains available if Bonjour is disabled.
-    if (
-        _server_state.global_settings is not None
-        and distributed_inference_enabled()
-        and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if _server_state.global_settings is not None and distributed_inference_enabled():
         bonjour_publisher = BonjourPublisher(
             port=_server_state.global_settings.server.port,
             version=__version__,
@@ -544,13 +540,9 @@ async def lifespan(app: FastAPI):
 
     # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
     # manual + Tailscale). Best-effort: discovery failures must never block
-    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    # serving.
     discovery_service = None
-    if (
-        distributed_inference_enabled()
-        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if distributed_inference_enabled():
         try:
             from .cluster.discovery import (
                 DiscoveryConfig,
@@ -1021,6 +1013,14 @@ async def invalid_request_error_handler(
     else:
         content = {"detail": str(exc)}
     return JSONResponse(status_code=400, content=content)
+
+
+@app.exception_handler(RequestAbortedError)
+async def request_aborted_handler(request: FastAPIRequest, exc: RequestAbortedError):
+    """Map a request aborted by a model unload to HTTP 409."""
+    return await http_exception_handler(
+        request, HTTPException(status_code=409, detail=str(exc))
+    )
 
 
 @app.exception_handler(SchedulerQueueFullError)
@@ -1639,7 +1639,7 @@ class _LLMEngineLease:
 
 async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
     reason = lease.abort_reason()
-    if reason == "manual admin unload":
+    if reason in ("manual admin unload", "manual unload"):
         raise HTTPException(
             status_code=409,
             detail="Request aborted because this model is being unloaded.",
@@ -3049,6 +3049,10 @@ async def _with_json_keepalive(
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
             return
+        except RequestAbortedError as e:
+            logger.warning("JSON keepalive request aborted: %s", e)
+            yield json.dumps(_openai_error_body(str(e), 409))
+            return
         except HTTPException as e:
             # Headers are already sent; preserve the API error in the body.
             logger.warning(
@@ -3710,8 +3714,23 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    # _unload_engine alone leaves active streams open; abort them first.
+    unloaded = await _server_state.engine_pool.request_unload(
+        model_id, reason="manual unload"
+    )
+    if not unloaded:
+        logger.info("Queued manual unload for active model: %s", model_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
     return {"status": "ok", "model_id": model_id}
 
 
@@ -3967,6 +3986,7 @@ async def create_rerank(
             documents=documents_raw,
             top_n=request.top_n,
             max_length=request.max_length,
+            instruction=request.instruction,
         )
 
     elapsed = time.perf_counter() - start_time

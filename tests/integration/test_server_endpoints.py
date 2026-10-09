@@ -1899,6 +1899,21 @@ class TestRerankEndpoint:
         calls = mock_engine_pool._reranker_engine.calls
         assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
+    def test_rerank_forwards_instruction(self, client, mock_engine_pool):
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        for extra in ({}, {"instruction": "Find numeric limits"}):
+            assert client.post("/v1/rerank", json={**body, **extra}).status_code == 200
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["instruction"] for call in calls] == [
+            None,
+            "Find numeric limits",
+        ]
+
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
         mock_engine_pool._models.append(
