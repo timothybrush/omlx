@@ -202,7 +202,7 @@ def _apply_output_dtype(config: dict, dtype: str) -> None:
     A source config describes the checkpoint oQ read, not the one it writes,
     and nothing in the load path corrects it, so a float16 build of a bfloat16
     source reads back as bfloat16. Follows ``_clone_config`` in
-    ``tools/clone_mlx_model_fp16.py``, but only rewrites keys the source
+    ``scripts/clone_mlx_model_fp16.py``, but only rewrites keys the source
     declared rather than adding any. ``vision_config`` is left alone: under a
     float16 target, vision and audio weights are stored as float32.
     """

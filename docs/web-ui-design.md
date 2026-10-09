@@ -1,10 +1,10 @@
 # Web UI design rules
 
-These rules cover the admin web UI under `omlx/admin` (login and dashboard). The chat page and the top navbar keep their own styles and are not covered here. Use them when you add or change a template, and rebuild the CSS afterwards with `cd omlx/admin && python build_css.py`.
+These rules cover the admin web UI in `apps/omlx-web/omlx_web` (login and dashboard). The chat page and the top navbar keep their own styles and are not covered here. Use them when you add or change a template, and rebuild the CSS afterwards with `cd omlx/admin && python build_css.py`.
 
 ## Colors
 
-Every color is defined in `omlx/admin/static/css/theme.css`, which `base.html` loads before `tailwind.css` and the page stylesheets.
+Every color is defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css` and the page stylesheets.
 
 - Palette entries are named `--palette-<family>-<step>` and hold `R G B` channels, so both `rgb(var(--palette-blue-500))` and `rgb(var(--palette-blue-500) / 0.2)` work.
 - Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`.
