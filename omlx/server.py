@@ -192,7 +192,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, GenerationOutput, VLMBatchedEngine
+from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
@@ -2184,6 +2184,30 @@ def get_embedding_max_length(
         return request_max_length
 
     return get_max_context_window(model_id)
+
+
+def _prepare_chat_prompt_for_request(
+    engine: BaseEngine,
+    messages: list,
+    tools: list | None = None,
+    chat_template_kwargs: dict | None = None,
+    is_partial: bool | None = None,
+) -> tuple[int, tuple[str, list[int]] | None]:
+    # Subclasses (e.g. distributed) have their own prompt handling.
+    if type(engine) is BatchedEngine:
+        prepared = engine.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(prepared[1]), prepared
+    return (
+        engine.count_chat_tokens(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        ),
+        None,
+    )
 
 
 def validate_context_window(
@@ -4549,6 +4573,8 @@ async def create_chat_completion(
                 messages = _inject_json_instruction(messages, json_instruction)
 
         tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+        # Resolve template defaults before preparing the prompt for reuse.
+        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -4561,7 +4587,8 @@ async def create_chat_completion(
         )
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -4627,7 +4654,8 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
@@ -4814,11 +4842,9 @@ async def create_chat_completion(
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -5577,6 +5603,9 @@ def _render_chat_prompt_for_thinking_detection(
     messages: list,
     kwargs: dict,
 ) -> tuple[str, list[int] | None]:
+    prepared = kwargs.get("_prepared_prompt")
+    if prepared is not None:
+        return prepared
     tokenizer = getattr(engine, "tokenizer", None)
     if tokenizer is None:
         return "", None
@@ -6189,11 +6218,9 @@ async def stream_chat_completion(
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
         if request.response_format and not tool_calls:
-            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+            cleaned_text, _, is_valid, error = parse_json_output(
                 cleaned_text, request.response_format
             )
-            if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
 
@@ -6568,7 +6595,10 @@ async def stream_anthropic_messages(
     # This is needed for message_start event
     estimated_input_tokens = 0
     try:
-        if hasattr(engine, "tokenizer") and engine.tokenizer is not None:
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            estimated_input_tokens = len(prepared[1])
+        elif hasattr(engine, "tokenizer") and engine.tokenizer is not None:
             # Build the prompt using chat template
             template_kwargs = {"tokenize": False, "add_generation_prompt": True}
             if kwargs.get("tools"):
@@ -7196,7 +7226,8 @@ async def create_anthropic_message(
 
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 internal_tools,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7213,6 +7244,9 @@ async def create_anthropic_message(
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
         validate_context_window(num_prompt_tokens, request.model)
+
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add stop sequences
         if request.stop_sequences:
@@ -7500,6 +7534,7 @@ async def _tokenize_chat_messages(
     )
     is_partial = chat_messages.is_partial or request.continue_final_message
     tools_for_template = _resolve_template_tools(chat_request, engine, resolved_model)
+    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
     await _ensure_tokenizer_for_system_probe(engine, chat_messages.messages)
     messages = prepare_system_messages_for_template(
         chat_messages.messages,
@@ -7510,8 +7545,6 @@ async def _tokenize_chat_messages(
         merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
         unsupported_mid_system_policy=_unsupported_mid_system_policy(),
     )
-    # Chat completions adds this after its context check, before rendering.
-    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
     add_generation_prompt = (
         None if is_partial or request.add_generation_prompt else False
     )
@@ -7843,6 +7876,15 @@ async def create_response(
         tools_for_template = (
             convert_tools_for_template(effective_tools) if effective_tools else None
         )
+        # Resolve template defaults before preparing the prompt for reuse.
+        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+        if (
+            native_reasoning
+            and merged_ct_kwargs.get("enable_thinking") is not False
+            and "preserve_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["preserve_thinking"] = True
+
         # Gemma 4 drops required params that lack descriptions — enrich them
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
@@ -7859,7 +7901,8 @@ async def create_response(
 
         # Validate context window
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7925,16 +7968,8 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
-        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-        if (
-            native_reasoning
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         if compiled_grammar is not None:
@@ -8097,11 +8132,9 @@ async def create_response(
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -8209,6 +8242,7 @@ async def stream_responses_api(
     last_output = None
     accumulated_text = ""
     accumulated_reasoning = ""
+    message_deltas = []
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -8496,6 +8530,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        message_deltas.append(content_delta)
                         seq = stream_state.next_sequence()
                         yield format_sse_event(
                             "response.output_text.delta",
@@ -8565,6 +8600,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                message_deltas.append(content_delta)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8585,6 +8621,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
+                message_deltas.append(remaining)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8632,6 +8669,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
+            message_deltas.append(cleaned_text)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8671,6 +8709,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
+            message_deltas.append(recovered_content)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8696,13 +8735,16 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # Final message content must preserve the bytes already emitted to clients.
+    final_text = "".join(message_deltas)
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        _, parsed_json, is_valid, error = parse_json_output(final_text, response_format)
-        if parsed_json is not None:
-            final_text = json.dumps(parsed_json)
+        json_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        # Unconstrained output can wrap the JSON in prose or a code fence.
+        # Strip those so clients can parse the final text as JSON.
+        if json_text != final_text.strip():
+            final_text = json_text
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 

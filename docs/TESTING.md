@@ -1,3 +1,7 @@
+# Qwen3-ASR audio quantization tests
+
+Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.
+
 # Cluster test filesystem isolation
 
 The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
@@ -79,6 +83,8 @@ Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check tha
 `test_mlx_vlm_qwen4_exp_compat.py::test_qwen4_mtp_one_row_step_is_the_serial_decode_step` checks that a one-row Lightning MTP window (the activation step and depth-0 cycles) runs the serial decode step: equal logits and cache state, no speculative transaction, and a following verify window that rolls back as usual. `OMLX_QWEN4_MTP_ONE_ROW_DECODE=0` keeps the verify forward for those windows.
 
 # Prefill memory accounting tests
+
+Run `python -m pytest -q tests/test_scheduler_prefill_eviction_progress.py` to check usage after prefill pauses. Cold and warm requests retain token progress across repeated pauses, report only restored prefix tokens as cached, and include locally computed tokens in prompt throughput.
 
 `python -m pytest -q tests/test_engine_preflight.py` checks route admission after eviction or reclaim. Both batched wrappers must refresh their cached MLX sample on the owning executor, including when the pool reports that no action was necessary. Controlled memory readings cover newly available headroom, insufficient headroom, and requests that already fit without executor work.
 
@@ -208,3 +214,7 @@ Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/tes
 # Engine idle timing tests
 
 Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.
+
+# Structured output Unicode tests
+
+Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events. Responses streaming must finish with the same text as the emitted deltas. They also check that an unpaired surrogate escape in the model JSON is returned unchanged instead of failing response serialization.

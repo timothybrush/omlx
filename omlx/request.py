@@ -135,7 +135,8 @@ class Request:
 
     # Prefix cache fields
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
-    cached_tokens: int = 0  # Number of tokens retrieved from cache
+    cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
+    prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
 
     # Paged cache fields (for BlockAwarePrefixCache)
@@ -237,6 +238,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
