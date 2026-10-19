@@ -14662,8 +14662,8 @@ class Scheduler:
 
     def _requeue_prefill_retry(self, request: "Request") -> None:
         """Reset a torn-down prefill request and requeue it at the front."""
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
+        # Drops only the SpecPrefill id. A request with an installed RoPE patch
+        # skips external/chunked prefill, so it never reaches this reset.
         if self._specprefill_active_request_id == request.request_id:
             self._specprefill_active_request_id = None
 
@@ -15878,8 +15878,8 @@ class Scheduler:
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
                     prefill_memory_profile=prefill_memory_profile,
-                    # ANE prefill holds fixed-shape I/O surfaces the first
-                    # long prompt dirties on top of KV+SDPA (issue #2841).
+                    # ANE program weights are wired during prefill on top
+                    # of KV+SDPA (issue #2841).
                     ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
                         self.model
                     ),
