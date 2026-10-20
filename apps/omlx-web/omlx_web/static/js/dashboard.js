@@ -172,7 +172,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, sub_keys: [] },
-                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, desktop_enabled: false },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -215,6 +215,8 @@
             // Splash launcher path row: manual entry when not detected or changed
             splashPath: { editing: false, draft: '', error: '', saving: false },
             splashOptionsError: '',
+            // Claude Desktop gateway profile state (macOS auto-config)
+            claudeDesktop: { configured: false, working: false, message: '' },
             // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
             ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
@@ -771,6 +773,8 @@
                     this.loadPresets(),
                     this.checkForUpdate()
                 ]);
+
+                this.fetchClaudeDesktopStatus();
 
                 this.startUpdateCheckTimer();
 
@@ -3846,11 +3850,15 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_desktop_enabled: this.globalSettings.claude_code.desktop_enabled,
                         }),
                     });
                     if (!response.ok) {
                         console.error('Failed to save Claude Code settings');
                     }
+                    // The toggle writes/restores the Claude Desktop gateway
+                    // profile server-side; refresh the shown state.
+                    this.fetchClaudeDesktopStatus();
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
                 }
@@ -4145,6 +4153,71 @@
                 }
             },
 
+            async fetchClaudeDesktopStatus() {
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/status');
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to fetch Claude Desktop status:', err);
+                }
+            },
+
+            async reapplyClaudeDesktopConfig() {
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const enabled = !!this.globalSettings.claude_code.desktop_enabled;
+                    const endpoint = enabled
+                        ? '/admin/api/claude-desktop/configure'
+                        : '/admin/api/claude-desktop/restore';
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        console.error('Failed to apply Claude Desktop configuration');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to apply Claude Desktop configuration:', err);
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
+            async restoreClaudeDesktopConfig() {
+                if (this.claudeDesktop.working) return;
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/restore', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.globalSettings.claude_code.desktop_enabled = false;
+                    await this.saveClaudeCodeSettings();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_success');
+                } catch (err) {
+                    console.error('Failed to restore Claude Desktop configuration:', err);
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -4153,6 +4226,10 @@
 
             get claudeCommand() {
                 return this._launchCmd('claude');
+            },
+
+            get claudeDesktopCommand() {
+                return this._launchCmd('claude_desktop');
             },
 
             get codexCommand() {
@@ -7088,8 +7165,18 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
-                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB \u00b7 ${this.formatSpeed(task)}`;
+                const eta = this.formatEta(task.eta_seconds);
+                return eta ? `${base} \u00b7 ${eta}` : base;
+            },
+
+            formatEta(seconds) {
+                if (seconds == null) return '';
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = seconds % 60;
+                const time = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+                return window.t('models.queue.eta').replace('{time}', time);
             },
 
             formatSpeed(task) {

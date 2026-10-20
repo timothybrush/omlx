@@ -106,10 +106,13 @@ from . import model_recommender
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    KeyLockout,
+    check_api_key,
     compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
+    verify_any_api_key,
     verify_api_key,
     verify_session,
     web_ui_enabled,
@@ -739,6 +742,11 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
+    claude_code_desktop_enabled: bool | None = None
+    # Side-effect flag for the Claude Desktop toggle: writing the user's
+    # Claude Desktop JSON configs is a visible side effect, so the restart
+    # of the Claude app is opt-in and never automatic.
+    restart_desktop: bool = False
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -1848,7 +1856,7 @@ def get_system_memory_info() -> dict:
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     """
     Authenticate with API key and create session.
 
@@ -1858,12 +1866,14 @@ async def login(request: LoginRequest, response: Response):
     Args:
         request: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request, used for the client's key budget.
 
     Returns:
         JSON response with success status.
 
     Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 while the client is locked out.
     """
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
@@ -1876,7 +1886,9 @@ async def login(request: LoginRequest, response: Response):
         )
 
     # Main key only — sub keys must not grant admin login
-    if not verify_api_key(request.api_key, server_api_key):
+    if not check_api_key(
+        http_request, lambda: verify_api_key(request.api_key, server_api_key)
+    ):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
@@ -1996,7 +2008,9 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+async def auto_login(
+    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
+):
     """
     Auto-login using API key and redirect to the target admin page.
 
@@ -2004,6 +2018,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     authentication, bypassing the manual login form.
 
     Args:
+        http_request: Incoming request, used for the client's key budget.
         key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
 
@@ -2019,7 +2034,15 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     server_api_key = global_settings.auth.api_key if global_settings else None
 
     # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    try:
+        key_ok = (
+            bool(key)
+            and bool(server_api_key)
+            and check_api_key(http_request, lambda: verify_api_key(key, server_api_key))
+        )
+    except KeyLockout:
+        key_ok = False
+    if not key_ok:
         return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()
@@ -2609,13 +2632,13 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and gs is not None:
         token = auth_header[7:]
-        server_key = gs.auth.api_key or ""
-        sub_keys = gs.auth.sub_keys or []
-        if verify_api_key(token, server_key):
+        if check_api_key(
+            request,
+            lambda: verify_any_api_key(
+                token, gs.auth.api_key or "", gs.auth.sub_keys or []
+            ),
+        ):
             return True
-        for sk in sub_keys:
-            if verify_api_key(token, getattr(sk, "key", "")):
-                return True
 
     raise HTTPException(
         status_code=401,
@@ -4659,6 +4682,7 @@ def _global_settings_response(global_settings):
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
             "haiku_model": global_settings.claude_code.haiku_model,
+            "desktop_enabled": global_settings.claude_code.desktop_enabled,
         },
         "integrations": {
             "codex_model": global_settings.integrations.codex_model,
@@ -5511,6 +5535,16 @@ async def update_global_settings(
     if "claude_code_haiku_model" in request.model_fields_set:
         global_settings.claude_code.haiku_model = request.claude_code_haiku_model
         claude_code_changed = True
+    if "claude_code_desktop_enabled" in request.model_fields_set:
+        desktop_previously_enabled = bool(
+            getattr(global_settings.claude_code, "desktop_enabled", False)
+        )
+        global_settings.claude_code.desktop_enabled = bool(
+            request.claude_code_desktop_enabled
+        )
+        claude_code_changed = True
+    else:
+        desktop_previously_enabled = None
 
     if claude_code_changed:
         runtime_applied.append("claude_code")
@@ -5519,7 +5553,8 @@ async def update_global_settings(
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
-            f"haiku={global_settings.claude_code.haiku_model}"
+            f"haiku={global_settings.claude_code.haiku_model}, "
+            f"desktop_enabled={global_settings.claude_code.desktop_enabled}"
         )
 
     # Apply integrations settings (Live - immediately applied)
@@ -5847,6 +5882,48 @@ async def update_global_settings(
         runtime_applied.append("embedding_batch_size")
         logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
 
+    # Claude Desktop auto-config side effect: enabling the toggle
+    # writes the user's Claude Desktop JSON configs to point at oMLX;
+    # disabling restores them. Best-effort — never fails the settings save.
+    # The route can also be invoked when only a restore is needed (toggle
+    # already off) via the dedicated /api/claude-desktop/* endpoints below.
+    claude_desktop_result: dict[str, Any] = {"applied": False}
+    if desktop_previously_enabled is not None:
+        desktop_now_enabled = bool(
+            getattr(global_settings.claude_code, "desktop_enabled", False)
+        )
+        try:
+            if desktop_now_enabled and not desktop_previously_enabled:
+                port, api_key = _resolve_claude_desktop_target(global_settings)
+                from ..integrations.claude_desktop import configure_omlx_gateway
+
+                applied = configure_omlx_gateway(port, api_key)
+                claude_desktop_result = {"applied": applied, "action": "configure"}
+                if applied:
+                    runtime_applied.append("claude_desktop")
+                    if request.restart_desktop:
+                        from ..integrations.claude_desktop import (
+                            restart_claude_desktop,
+                        )
+
+                        restart_claude_desktop()
+            elif not desktop_now_enabled and desktop_previously_enabled:
+                from ..integrations.claude_desktop import restore
+
+                applied = restore()
+                claude_desktop_result = {"applied": applied, "action": "restore"}
+                if applied:
+                    runtime_applied.append("claude_desktop")
+                    if request.restart_desktop:
+                        from ..integrations.claude_desktop import (
+                            restart_claude_desktop,
+                        )
+
+                        restart_claude_desktop()
+        except Exception as exc:
+            logger.warning("Claude Desktop auto-config failed: %s", exc)
+            claude_desktop_result = {"applied": False, "error": str(exc)}
+
     # Build response message
     message = "Settings saved successfully."
 
@@ -5854,6 +5931,124 @@ async def update_global_settings(
         "success": True,
         "message": message,
         "runtime_applied": runtime_applied,
+        "claude_desktop": claude_desktop_result,
+    }
+
+
+def _resolve_claude_desktop_target(
+    global_settings, port: int | None = None, api_key: str | None = None
+) -> tuple[int, str]:
+    """Resolve the oMLX (port, api_key) pair for the Claude Desktop gateway profile.
+
+    Explicit overrides win; otherwise the configured server port and the live
+    server API key are used. An empty key falls back to ``"omlx"`` (open server).
+    """
+    resolved_port = port or getattr(global_settings.server, "port", 8000) or 8000
+    resolved_key = (api_key or "").strip()
+    if not resolved_key:
+        try:
+            from ..server import _server_state
+
+            resolved_key = (_server_state.api_key or "").strip()
+        except Exception:
+            resolved_key = ""
+    if not resolved_key:
+        resolved_key = (getattr(global_settings.auth, "api_key", "") or "").strip()
+    return int(resolved_port), resolved_key or "omlx"
+
+
+class ClaudeDesktopConfigureRequest(BaseModel):
+    """Request model for (re-)applying the Claude Desktop gateway profile."""
+
+    restart_desktop: bool = False
+    port: int | None = None
+    api_key: str | None = None
+
+
+class ClaudeDesktopRestoreRequest(BaseModel):
+    """Request model for restoring the pre-oMLX Claude Desktop configuration."""
+
+    restart_desktop: bool = False
+
+
+@router.get("/api/claude-desktop/status")
+async def claude_desktop_status(
+    is_admin: bool = Depends(require_admin),
+):
+    """Return whether the oMLX Claude Desktop gateway profile is applied."""
+    from ..integrations.claude_desktop import PROFILE_ID, is_configured
+
+    return {
+        "configured": bool(is_configured()),
+        "profile_id": PROFILE_ID,
+    }
+
+
+@router.post("/api/claude-desktop/configure")
+async def claude_desktop_configure(
+    request: ClaudeDesktopConfigureRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """(Re-)apply the oMLX Claude Desktop gateway profile (macOS only).
+
+    Writes the user's Claude Desktop JSON configs — this side effect is
+    shown explicitly in the admin panel. Restarting the Claude app is
+    opt-in via ``restart_desktop`` and never automatic.
+    """
+    from ..integrations import claude_desktop as desktop
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    port, api_key = _resolve_claude_desktop_target(
+        global_settings, request.port, request.api_key
+    )
+    try:
+        applied = desktop.configure_omlx_gateway(port, api_key)
+    except Exception as exc:
+        logger.warning("Claude Desktop configure failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Configure failed: {exc}")
+    if applied and request.restart_desktop:
+        desktop.restart_claude_desktop()
+    return {
+        "success": True,
+        "configured": bool(desktop.is_configured()),
+        "applied": applied,
+        "profile_id": desktop.PROFILE_ID,
+    }
+
+
+@router.post("/api/claude-desktop/restore")
+async def claude_desktop_restore(
+    request: ClaudeDesktopRestoreRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Restore the pre-oMLX Claude Desktop configuration (macOS only)."""
+    from ..integrations import claude_desktop as desktop
+
+    if _get_global_settings() is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    try:
+        applied = desktop.restore()
+    except Exception as exc:
+        logger.warning("Claude Desktop restore failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Restore failed: {exc}")
+    if applied and request.restart_desktop:
+        desktop.restart_claude_desktop()
+    # Keep the persisted flag in sync so the dashboard toggle reflects
+    # reality after a direct restore call (not just via the settings PATCH).
+    global_settings = _get_global_settings()
+    if global_settings is not None and global_settings.claude_code.desktop_enabled:
+        global_settings.claude_code.desktop_enabled = False
+        try:
+            global_settings.save()
+        except Exception as e:
+            logger.warning("Failed to persist desktop_enabled after restore: %s", e)
+    return {
+        "success": True,
+        "configured": bool(desktop.is_configured()),
+        "applied": applied,
+        "profile_id": desktop.PROFILE_ID,
     }
 
 
