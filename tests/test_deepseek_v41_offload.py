@@ -798,7 +798,7 @@ def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "PAGE_IO_WORKERS", 2)
 
     def blocked_read(fd, count, offset):
-        if offset == 0:
+        if offset == reader._start:
             raise OSError("page read failed")
         entered.set()
         assert release.wait(5)
@@ -816,7 +816,8 @@ def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
             assert entered.wait(5)
             closed = executor.submit(close)
             assert closing.wait(5)
-            assert not closed.done()
+            with pytest.raises(TimeoutError):
+                closed.result(timeout=0.1)
         finally:
             release.set()
         with pytest.raises(OSError, match="page read failed"):
