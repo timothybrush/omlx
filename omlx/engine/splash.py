@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 from transformers import AutoTokenizer
 
+from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -81,6 +82,9 @@ SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
 )
+
+# Splash /status chat_template.later_system values (#4697).
+_LATER_SYSTEM_SUPPORT = {"native": True, "patched": True, "unsupported": False}
 
 # Splash's reasoning levels, and the oMLX spellings that map onto them.
 _SPLASH_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -1107,10 +1111,18 @@ class SplashEngine(BaseEngine):
             response = await self._client.get("/status", timeout=2)
             response.raise_for_status()
             data = response.json()
-            if isinstance(data, dict):
-                self._status = data
         except Exception:
             logger.debug("Splash: failed to fetch /status", exc_info=True)
+            return
+        if not isinstance(data, dict):
+            return
+        self._status = data
+        later = (data.get("chat_template") or {}).get("later_system")
+        if self._tokenizer is not None:
+            # Named templates report a dict, which leaves the local probe in charge.
+            self._tokenizer._omlx_supports_mid_system_messages = (
+                _LATER_SYSTEM_SUPPORT.get(later) if isinstance(later, str) else None
+            )
 
     async def _poll_status(self) -> None:
         while True:
@@ -1330,9 +1342,16 @@ class SplashEngine(BaseEngine):
         body["messages"] = splash_messages(messages)
         if tools:
             body["tools"] = tools
-        effort = splash_effort(kwargs.get("chat_template_kwargs"))
+        template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        effort = splash_effort(template_kwargs)
         if effort:
             body["reasoning_effort"] = effort
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless this is set, so every new user turn would miss the
+        # prefix cache from the first stripped assistant turn onward.
+        preserve = template_kwargs.get("preserve_thinking")
+        if isinstance(preserve, bool):
+            body["preserve_thinking"] = preserve
         async for output in self._stream(body, kwargs.get("_request_id")):
             yield output
 
@@ -1342,6 +1361,9 @@ class SplashEngine(BaseEngine):
     def count_chat_tokens(
         self, messages, tools=None, chat_template_kwargs=None, is_partial=None
     ) -> int:
+        # The local template can reject a later system message that Splash
+        # renders in place; the folded form has the same text.
+        messages = _consolidate_system_messages(messages)
         template = dict(chat_template_kwargs or {})
         attempts = (
             template,

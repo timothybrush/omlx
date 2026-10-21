@@ -684,6 +684,33 @@ class TestStreaming:
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
 
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"preserve_thinking": True}, True),
+            ({"preserve_thinking": False}, False),
+            ({"reasoning_effort": "high"}, None),
+            (None, None),
+        ],
+    )
+    async def test_preserve_thinking_is_forwarded(self, tmp_path, kwargs, expected):
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless preserve_thinking is set, which defeats prefix caching.
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        async for _ in engine.stream_chat(
+            [{"role": "user", "content": "hi"}], chat_template_kwargs=kwargs
+        ):
+            pass
+        assert seen["body"].get("preserve_thinking") is expected
+
     async def test_unfinished_reasoning_is_closed(self, tmp_path):
         def handler(request):
             return httpx.Response(
@@ -1837,3 +1864,47 @@ class TestVision:
             {"type": "text", "text": "?"},
             {"type": "image_url", "image_url": {"url": url, "detail": "auto"}},
         ]
+
+
+# -- later system messages (#4697) -------------------------------------------------
+
+
+class TestLaterSystem:
+    @pytest.mark.parametrize(
+        ("later_system", "expected"),
+        [
+            ("native", True),
+            ("patched", True),
+            ("unsupported", False),
+            ({"default": "patched", "tool_use": "native"}, None),
+        ],
+    )
+    async def test_status_sets_the_tokenizer_capability(
+        self, tmp_path, later_system, expected
+    ):
+        status = {"chat_template": {"later_system": later_system}}
+        engine = _engine_with_transport(
+            tmp_path, lambda request: httpx.Response(200, json=status)
+        )
+        engine._tokenizer = SimpleNamespace()
+
+        await engine._refresh_status()
+
+        assert engine._tokenizer._omlx_supports_mid_system_messages is expected
+
+    def test_token_count_folds_later_system_messages(self, tmp_path):
+        class StrictTemplate:
+            def apply_chat_template(self, messages, **kwargs):
+                if any(m["role"] == "system" for m in messages[1:]):
+                    raise ValueError("System message must be at the beginning.")
+                return list("".join(f"<{m['role']}>{m['content']}" for m in messages))
+
+        engine = _engine(tmp_path)
+        engine._tokenizer = StrictTemplate()
+        messages = [
+            {"role": "system", "content": "lead"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "note"},
+        ]
+
+        assert engine.count_chat_tokens(messages) == len("<system>lead\n\nnote<user>hi")
