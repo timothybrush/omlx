@@ -12796,8 +12796,10 @@ class Scheduler:
             elif batch_specprefill_status != request_is_specprefill:
                 self.waiting.appendleft(request)
                 break
-            if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
+            if request_is_specprefill and (
+                len(scheduled) > 0 or self.running or self.prefilling
+            ):
+                # The offset RoPE would also shift running and prefilling rows.
                 self.waiting.appendleft(request)
                 break
 
