@@ -4510,6 +4510,10 @@ def _build_model_sanitizer(
     """
     if _is_muse_spark(config):
         return muse_spark_layout.sanitizer(config, text_only=text_only)
+    if config.get("model_type") == "flint":
+        from mlx_vlm.models.flint import Model, ModelConfig
+
+        return Model(ModelConfig.from_dict(config)).sanitize
     architectures = config.get("architectures", [])
     # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
     # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
@@ -8061,6 +8065,7 @@ _GEMMA4_LAYER_STATE_KIND = "gemma4_shared_kv"
 _QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
 _GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
 _EMBEDDING_GEMMA2_LAYER_STATE_KIND = "embedding_gemma2"
+_FLINT_LAYER_STATE_KIND = "flint"
 
 
 def _find_layer_model(model, layers):
@@ -8336,6 +8341,14 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
     """Forward pass through a transformer layer, returning output and aux."""
     if (
         isinstance(position_ids, dict)
+        and position_ids.get("kind") == _FLINT_LAYER_STATE_KIND
+    ):
+        mask = create_attention_mask(
+            inputs, None, window_size=block.self_attn.window_size
+        )
+        return block(inputs, mask=mask, cache=None), None
+    if (
+        isinstance(position_ids, dict)
         and position_ids.get("kind") == _GEMMA4_LAYER_STATE_KIND
     ):
         if layer_idx is None:
@@ -8596,6 +8609,8 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
             "",
         )
     )
+    if model_type == "flint":
+        return inputs, [None] * len(layers), {"kind": _FLINT_LAYER_STATE_KIND}
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
         return gemma4_inputs
@@ -8971,8 +8986,8 @@ def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
     return name in collector.entries
 
 
-def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
-    if str(getattr(model, "model_type", "")) != "glm5_next":
+def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
+    if str(getattr(model, "model_type", "")) not in ("glm5_next", "flint"):
         return False
     language_model = getattr(model, "language_model", None)
     core = getattr(language_model, "model", None)
@@ -9280,7 +9295,7 @@ def _collect_imatrix_from_model(
                     mx.synchronize()
                     mx.clear_cache()
 
-                _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+                _collect_language_model_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
 
                 # Match the head's decode-time hidden-state normalization.
@@ -9448,7 +9463,7 @@ _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
-    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark"}
+    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
 )
 
 
@@ -9465,6 +9480,11 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         config, has_mtp_heads=False, has_mtp_weights=False
     )
     maybe_apply_pre_load_patches(str(model_path), for_vlm=True, model_settings=settings)
+    if _stream_source_model_type(config) == "flint":
+        from mlx_vlm.models.flint.config import ModelConfig
+        from mlx_vlm.models.flint.language import DecoderLayer
+
+        return ModelConfig.from_dict(config), DecoderLayer
     if _stream_source_model_type(config) == "qwen4_exp":
         from mlx_vlm.models.qwen4_exp.config import TextConfig
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
@@ -9848,6 +9868,14 @@ def _streamed_sensitivity_state(
     if calib_data is None:
         return None
     inputs = _streamed_embed(embed_weight, calib_data, config)
+    if _stream_source_model_type(config) == "flint":
+        mx.eval(inputs)
+        return {
+            "inputs": inputs,
+            "mask": None,
+            "position_ids": {"kind": _FLINT_LAYER_STATE_KIND},
+            "scores": {},
+        }
     if _stream_source_model_type(config) == "glm5_next":
         inputs, attention_mask = _streamed_glm5_next_state(config, inputs)
         mx.eval(inputs)
@@ -9981,7 +10009,7 @@ def _collect_streamed_qwen4_mtp(source, config, collector, calib_data, working, 
     return installed
 
 
-def _collect_streamed_glm5_next_lm_head(source, config, collector, working) -> int:
+def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     """Streamed counterpart of _collect_untied_lm_head_imatrix."""
     plan = _streamed_source_plan(source, config)
     norm_key = "language_model.model.norm.weight"
@@ -9990,7 +10018,7 @@ def _collect_streamed_glm5_next_lm_head(source, config, collector, working) -> i
         return 0
     head_weight = plan.pop(head_key)
     norm_weight = plan.pop(norm_key)
-    text_config = config.get("text_config") or {}
+    text_config = config.get("text_config") or config
     hidden_size = int(head_weight.shape[1])
     norm = nn.RMSNorm(hidden_size, eps=float(text_config.get("rms_norm_eps") or 1e-6))
     norm.weight = norm_weight
@@ -10189,6 +10217,9 @@ def _collect_imatrix_streaming(
         mx.eval(embedded)
         mask = glm5_attention_mask
         position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
+    elif _stream_source_model_type(config) == "flint":
+        mask = None
+        position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
     else:
         # One causal mask and one position-id row serve every layer and every
         # micro-batch: both depend only on seq_length and the activation dtype.
@@ -10353,8 +10384,8 @@ def _collect_imatrix_streaming(
                 },
             )
 
-        if is_glm5_next:
-            head_entries = _collect_streamed_glm5_next_lm_head(
+        if is_glm5_next or _stream_source_model_type(config) == "flint":
+            head_entries = _collect_streamed_untied_lm_head(
                 source, config, collector, working
             )
             if round_index == 0:
