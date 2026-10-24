@@ -204,6 +204,12 @@ class TestUniversalQuantPredicate:
             is False
         )
 
+    def test_minimax_patch_merger_not_quantized(self, dense_config, module):
+        # MiniMax M3 projects merged image patches into the text space with
+        # patch_merge_mlp, after multi_modal_projector: part of the vision path.
+        for path in ("patch_merge_mlp.linear_1", "patch_merge_mlp.linear_2"):
+            assert universal_quant_predicate(path, module, dense_config) is False
+
     def test_ssm_alpha_not_quantized(self, dense_config, module):
         assert (
             universal_quant_predicate("model.layers.0.ssm_alpha", module, dense_config)
@@ -2338,6 +2344,68 @@ class TestEmbeddingGemma2Calibration:
             "language_model.norm.weight": mx.zeros((16,)),
         }
         assert set(sanitize(weights)) == set(weights)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestDiffusionGemmaSanitizer:
+    _TEXT = {
+        "vocab_size": 32,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "global_head_dim": 4,
+        "num_experts": 2,
+        "top_k_experts": 1,
+    }
+
+    def test_streaming_plan_reads_the_encoder_vision_tower(self, tmp_path):
+        """DiffusionGemma's sanitize checks self.model.encoder.vision_tower."""
+        pytest.importorskip("mlx_vlm.models.diffusion_gemma")
+        config = {
+            "model_type": "diffusion_gemma",
+            "architectures": ["DiffusionGemmaForBlockDiffusion"],
+            "text_config": self._TEXT,
+            "vision_config": {"hidden_size": 8},
+        }
+        path = tmp_path / "model.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                "model.decoder.embed_tokens.weight": np.zeros((32, 8), np.float16),
+                "model.decoder.layers.0.experts.gate_up_proj": np.zeros(
+                    (2, 8, 8), np.float16
+                ),
+                "model.decoder.layers.0.experts.down_proj": np.zeros(
+                    (2, 8, 4), np.float16
+                ),
+                "model.encoder.language_model.layers.0.layer_scalar": np.ones(
+                    (1,), np.float16
+                ),
+                "model.encoder.vision_tower.encoder.layers.0.mlp.up_proj.linear.weight": np.zeros(
+                    (8, 8), np.float16
+                ),
+                "model.encoder.embed_vision.embedding_projection.weight": np.zeros(
+                    (8, 8), np.float16
+                ),
+            },
+        )
+
+        sanitize = _build_model_sanitizer(config, text_only=False)
+        plan = _discover_sanitize_plan(sanitize, _LazyTensorIndex([str(path)]))
+
+        assert plan is not None
+        assert set(plan) == {
+            "model.decoder.embed_tokens.weight",
+            "model.decoder.layers.0.experts.gate_up_proj.weight",
+            "model.decoder.layers.0.experts.down_proj.weight",
+            "model.encoder.language_model.layers.0.layer_scalar",
+            "model.encoder.vision_tower.encoder.layers.0.mlp.up_proj.linear.weight",
+            "model.encoder.embed_vision.embedding_projection.weight",
+        }
 
 
 class TestLazyTensorIndex:
