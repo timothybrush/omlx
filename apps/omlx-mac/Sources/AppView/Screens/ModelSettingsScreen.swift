@@ -999,13 +999,17 @@ private struct BasicSection: View {
                     )
                 }
             }
-            if vm.showsEmbeddingContextWindow {
+            if vm.showsEmbeddingContextWindow || vm.showsRerankerContextWindow {
                 Row(label: String(localized: "settings.basic.context_window.label",
                                   defaultValue: "Context Window",
                                   comment: "Row label for the context window field"),
-                    sublabel: String(localized: "settings.basic.embedding_context_window.sub",
-                                     defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
-                                     comment: "Sublabel for the context window field of an embedding model")) {
+                    sublabel: vm.showsRerankerContextWindow
+                        ? String(localized: "settings.basic.reranker_context_window.sub",
+                                 defaultValue: "Used when a request does not set max_length. Jina rerankers read documents together up to this many tokens, other rerankers cut each query-document pair to this length.",
+                                 comment: "Sublabel for the context window field of a reranker model")
+                        : String(localized: "settings.basic.embedding_context_window.sub",
+                                 defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
+                                 comment: "Sublabel for the context window field of an embedding model")) {
                     TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
                 }
             }
@@ -1219,6 +1223,19 @@ private struct AdvancedPage: View {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
                 .tint(theme.redDot)
+            }
+            if showsLLMRows && vm.model?.activationFp16Supported == true {
+                Row(label: String(localized: "settings.advanced.activation_fp16.label",
+                                  defaultValue: "Float16 Activations",
+                                  comment: "Row label for the load-time bfloat16 to float16 recast toggle"),
+                    sublabel: vm.activationFp16ConflictReason ?? String(localized: "settings.advanced.activation_fp16.sub",
+                                     defaultValue: "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16.",
+                                     comment: "Sublabel for the load-time bfloat16 to float16 recast toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.activationFp16Enabled, save: {
+                        Task { await vm.save(.activationFp16, client: client) }
+                    }))
+                    .disabled(vm.activationFp16ConflictReason != nil && !vm.activationFp16Enabled)
+                }
             }
             if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",

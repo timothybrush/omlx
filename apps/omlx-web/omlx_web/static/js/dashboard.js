@@ -263,6 +263,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            moeOffloadFit: null,
+            moeOffloadFitUrl: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -2155,6 +2157,8 @@
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     qwen4_gdn_decode_wide_proj:
                         s.qwen4_gdn_decode_wide_proj === true,
+                    activation_fp16_enabled: s.activation_fp16_enabled === true,
+                    activation_fp16_supported: model?.activation_fp16_supported === true,
                     qwen4_gdn_decode_wide_proj_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'qwen4_exp',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
@@ -2265,6 +2269,41 @@
                         ),
                     );
                 }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            loadMoeOffloadFit() {
+                // Sized from the unsaved edits that change the estimate; refetch only when they change.
+                const model = this.selectedModel;
+                if (model?.moe_expert_offload_supported !== true) return;
+                const payload = this.buildModelSettingsPayload(this.modelSettings);
+                const params = new URLSearchParams();
+                for (const key of ['mtp_enabled', 'qwen4_ple_ssd_offload', 'deepseek_v41_engram_ssd_offload']) {
+                    params.set(key, String(!!payload[key]));
+                }
+                const url = `/admin/api/models/${encodeURIComponent(model.id)}/moe-offload-fit?${params}`;
+                if (url === this.moeOffloadFitUrl) return;
+                this.moeOffloadFitUrl = url;
+                this.moeOffloadFit = null;
+                return fetch(url).then(async resp => {
+                    if (!resp.ok) return;
+                    const fit = await resp.json();
+                    if (this.moeOffloadFitUrl === url) this.moeOffloadFit = fit;
+                }).catch(() => { /* network error */ });
+            },
+
+            moeOffloadFitText() {
+                const fit = this.moeOffloadFit;
+                const key = fit?.status === 'fit' ? 'moe_expert_offload_fit' : 'moe_expert_offload_no_fit';
+                return window.t(`modal.model_settings.${key}`)
+                    .replace('{percent}', fit?.max_percent)
+                    .replace('{size}', this.formatByteCount(fit?.bytes))
+                    .replace('{reserve}', this.formatByteCount(fit?.reserve_bytes));
+            },
+
+            applyMoeOffloadFit() {
+                if (this.moeOffloadFit?.status !== 'fit') return;
+                this.modelSettings.moe_expert_offload_resident_percent = this.moeOffloadFit.max_percent;
                 this.onMoeExpertOffloadResidentPercent();
             },
 
@@ -2974,6 +3013,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // A fresh open re-sizes; a focus refresh keeps the current hint.
+                if (!preservingEdits) this.moeOffloadFitUrl = null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
@@ -3197,6 +3238,7 @@
                         !!ms.deepseek_v41_ced_prefill_enabled,
                     qwen4_gdn_decode_wide_proj:
                         !!ms.qwen4_gdn_decode_wide_proj,
+                    activation_fp16_enabled: !!ms.activation_fp16_enabled,
                     deepseek_v41_engram_ssd_offload:
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
@@ -4604,11 +4646,15 @@
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        throw new Error(data.detail || window.t('js.error.clear_ssd_cache_failed'));
+                    }
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
+                    alert(err.message || window.t('js.error.clear_ssd_cache_failed'));
                     this.showClearSsdCacheConfirm = false;
                 }
             },
@@ -7786,27 +7832,14 @@
                 }
             },
 
-            // A GGUF model file: at the repo root or split in its VARIANT/ folder.
-            isGgufModelFile(name) {
-                const lower = name.toLowerCase();
-                if (!lower.endsWith('.gguf') || lower.includes('mmproj')) return false;
-                const [folder, base, ...rest] = lower.split('/');
-                if (base === undefined) return true;
-                const split = base.match(/^(.+)-\d{5}-of-\d{5}\.gguf$/);
-                return !rest.length && !folder.startsWith('.') && !!split
-                    && split[1].endsWith(`-${folder}`);
-            },
-
             // The GGUF model files a task fetches, shown beside its repo.
             taskGgufFiles(task) {
-                return (task.files || []).filter(name => this.isGgufModelFile(name)).join(', ');
+                return (task.gguf_files || []).join(', ');
             },
 
-            // The model ID a finished download serves under: a GGUF's file name.
+            // The model ID a finished download serves under.
             taskModelId(task) {
-                const name = (task.files || []).find(f => this.isGgufModelFile(f));
-                if (!name) return task.repo_id.split('/').pop();
-                return name.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '');
+                return task.gguf_model_id || task.repo_id.split('/').pop();
             },
 
             // Every download picks its files in the detail modal first.

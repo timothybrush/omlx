@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -51,6 +52,10 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
+from ..engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
+from ..exceptions import ModelBusyError
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -89,13 +94,14 @@ from ..utils import gpu_power
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
+    get_apple_gpu_generation,
     get_chip_name,
     get_gpu_core_count,
     get_io_platform_uuid,
     get_total_memory_gb,
     parse_chip_info,
 )
-from ..utils.model_loading import dflash_compatibility
+from ..utils.model_loading import checkpoint_has_bf16_leaves, dflash_compatibility
 from ..utils.network import is_loopback_bind
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
@@ -383,6 +389,8 @@ class ModelSettingsRequest(BaseModel):
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
+    # Recast the checkpoint's bfloat16 leaves to float16 after load
+    activation_fp16_enabled: bool | None = None
     # KV cache compression
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_scheme: str | None = None
@@ -2409,6 +2417,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
     # Combine model info with settings
     models = []
+    # M1/M2 GPUs (families 13/14) have no native bf16 ALU path.
+    fp16_recast_gpu = get_apple_gpu_generation() in (13, 14)
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
@@ -2422,6 +2432,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
+        activation_fp16_supported = fp16_recast_gpu and checkpoint_has_bf16_leaves(
             model_info.get("model_path") or ""
         )
         qwen4_ple_ssd_offload_supported = False
@@ -2566,6 +2579,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "activation_fp16_supported": activation_fp16_supported,
         }
 
         model_data.update(_model_options(model_data, settings))
@@ -2719,6 +2733,42 @@ async def load_model(
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
+@router.get("/api/models/{model_id}/moe-offload-fit")
+async def get_moe_offload_fit(
+    model_id: str,
+    mtp_enabled: bool | None = None,
+    qwen4_ple_ssd_offload: bool | None = None,
+    deepseek_v41_engram_ssd_offload: bool | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Largest expert-offload residency that leaves prompt room on this machine.
+
+    The query flags override saved settings that change the size estimate, so
+    unsaved edits in the dashboard are sized too.
+    """
+    entry = _require_model(model_id)
+    if not moe_offload_compatibility(entry.model_path)[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model does not support MoE expert offload: {model_id}",
+        )
+    settings_manager = _get_settings_manager()
+    saved = settings_manager.get_settings(model_id) if settings_manager else None
+    settings = copy.copy(saved) if saved is not None else ModelSettings()
+    for key, value in (
+        ("mtp_enabled", mtp_enabled),
+        ("qwen4_ple_ssd_offload", qwen4_ple_ssd_offload),
+        ("deepseek_v41_engram_ssd_offload", deepseek_v41_engram_ssd_offload),
+    ):
+        if value is not None:
+            setattr(settings, key, value)
+    pool = _get_engine_pool()
+    # Read the live ceiling here; the per-probe header scans run off the loop.
+    return await asyncio.to_thread(
+        pool.moe_offload_fit, entry, settings, pool._current_ceiling()
+    )
 
 
 @router.post("/api/models/{model_id}/import-mtplx")
@@ -2994,6 +3044,11 @@ async def update_model_settings(
             request.index_cache_freq
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
+        )
+    # Load-time activation dtype recast
+    if "activation_fp16_enabled" in sent:
+        current_settings.activation_fp16_enabled = (
+            request.activation_fp16_enabled or False
         )
     # KV cache compression settings
     if "turboquant_kv_enabled" in sent:
@@ -6465,6 +6520,7 @@ def _build_runtime_cache_observability(
         return payload
 
     block_sizes = set()
+    live_splash_dirs = set()
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6691,6 +6747,8 @@ def _build_runtime_cache_observability(
         if isinstance(splash_cache, dict):
             model_payload["cache_tier"] = "splash"
             model_payload["splash_cache"] = splash_cache
+            if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir:
+                live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -6746,6 +6804,14 @@ def _build_runtime_cache_observability(
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
+    try:
+        files, size = scan_splash_ssd_cache(
+            cache_dir / "splash", exclude=live_splash_dirs
+        )
+        payload["total_num_files"] += files
+        payload["total_size_bytes"] += size
+    except OSError as exc:
+        logger.warning("Failed to scan Splash SSD cache: %s", exc)
     return payload
 
 
@@ -7268,6 +7334,26 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     total_deleted = 0
     distributed_ranks = 0
     distributed_failures = []
+
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_root = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "splash"
+        )
+        pool = _get_engine_pool()
+        clear_splash = getattr(pool, "clear_splash_ssd_cache", None)
+        try:
+            if callable(clear_splash):
+                total_deleted += await clear_splash(cache_root)
+            else:
+                total_deleted += scan_splash_ssd_cache(cache_root, clear=True)[0]
+        except ModelBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Could not delete Splash SSD cache: {exc}"
+            ) from exc
 
     for model_id, scheduler, core in _iter_loaded_engine_records():
         distributed_clear = getattr(core, "clear_prompt_caches", None)

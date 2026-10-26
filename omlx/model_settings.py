@@ -53,6 +53,12 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
     if not settings.get("moe_expert_offload_enabled"):
         return
+    # Offload slots live outside the module tree, so the recast leaves them bf16.
+    if settings.get("activation_fp16_enabled"):
+        raise ValueError(
+            "MoE expert offload cannot be combined with the float16 activation "
+            "recast; disable one of them first."
+        )
     # VLM MTP and DFlash have no offload-aware draft path at all.
     if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
@@ -390,6 +396,10 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
+    # float16 after load, so the forward runs on the GPU's native float16 path
+    # instead of the emulated bfloat16 one. Quantized payloads are untouched.
+    activation_fp16_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

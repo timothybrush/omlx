@@ -10,7 +10,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
@@ -1584,6 +1584,99 @@ def materialize_lazy_state(model: Any) -> None:
         # command buffer; small models see only a handful of chunks. See #3179.
         for start in range(0, len(arrays), _MATERIALIZE_EVAL_CHUNK):
             mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
+
+
+def checkpoint_has_bf16_leaves(model_path: str) -> bool:
+    """Whether the checkpoint on disk still carries bfloat16 tensors.
+
+    The fp16 activation recast only has work to do when it does: a checkpoint
+    already stored in float16 makes the toggle a no-op, so the admin UI uses
+    this to gate it out. Reads only the safetensors headers (a few KB each) and
+    stops at the first bfloat16 tensor.
+    """
+    if not model_path:
+        return False
+    try:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+    except OSError:
+        return False
+    for shard in shards:
+        try:
+            with open(shard, "rb") as handle:
+                header_len = int.from_bytes(handle.read(8), "little")
+                header = json.loads(handle.read(header_len))
+        except (OSError, ValueError):
+            continue
+        for name, spec in header.items():
+            if (
+                name != "__metadata__"
+                and isinstance(spec, dict)
+                and spec.get("dtype") == "BF16"
+            ):
+                return True
+    return False
+
+
+def cast_bf16_params_to_fp16(model: Any) -> int:
+    """Recast every bfloat16 parameter of a loaded model to float16.
+
+    M1/M2 GPUs emulate bfloat16 but run float16 natively. The activation dtype
+    follows the non-quantized leaves (scales, biases, norms, embeddings), so
+    recasting them moves the forward onto the native path. Quantized U32
+    payloads are untouched.
+
+    A value outside the float16 range raises ValueError before any leaf
+    changes. Leaves are then swapped one chunk at a time, so peak memory grows
+    by one chunk instead of a second copy of every bfloat16 leaf.
+
+    Returns the number of tensors recast.
+    """
+    pending = [
+        (key, value)
+        for key, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and value.dtype == mx.bfloat16
+    ]
+    count = len(pending)
+    fp16_max = mx.finfo(mx.float16).max
+    # Reductions only, so this pass allocates no tensor-sized temporaries.
+    for start in range(0, count, _MATERIALIZE_EVAL_CHUNK):
+        bounds = [
+            bound
+            for _, value in pending[start : start + _MATERIALIZE_EVAL_CHUNK]
+            for bound in (mx.max(value), mx.min(value))
+        ]
+        mx.eval(bounds)
+        if any(abs(bound.item()) > fp16_max for bound in bounds):
+            raise ValueError("a bfloat16 tensor exceeds the float16 range")
+    while pending:
+        # Rebinding ``pending`` drops the previous chunk's bfloat16 originals.
+        chunk = pending[:_MATERIALIZE_EVAL_CHUNK]
+        pending = pending[_MATERIALIZE_EVAL_CHUNK:]
+        converted = [(key, value.astype(mx.float16)) for key, value in chunk]
+        mx.eval([value for _, value in converted])
+        model.update(tree_unflatten(converted))
+        del chunk, converted
+    if count:
+        # Read by numerics_revision_for_model so bfloat16 KV blocks are not reused.
+        model._omlx_fp16_recast = True
+    return count
+
+
+def apply_activation_fp16(model: Any, model_settings: Any = None) -> None:
+    """Run the float16 recast when the model settings enable it."""
+    if not getattr(model_settings, "activation_fp16_enabled", False):
+        return
+    try:
+        recast = cast_bf16_params_to_fp16(model)
+    except Exception:
+        logger.warning(
+            "fp16 activation recast failed; staying on bfloat16", exc_info=True
+        )
+        return
+    if recast:
+        logger.info("activation dtype: bfloat16 -> float16 (%d tensors)", recast)
+    else:
+        logger.info("activation dtype: no bfloat16 leaves; nothing to recast")
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
