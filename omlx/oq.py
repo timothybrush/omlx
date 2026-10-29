@@ -1306,7 +1306,6 @@ def _build_quant_plan(
     hard_cap_bpw: float = 4.7,
     fixed_overrides: dict[str, dict] | None = None,
     supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
-    always_on_rules: bool = True,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
@@ -1327,38 +1326,34 @@ def _build_quant_plan(
     An MTP head is planned after the backbone (_plan_mtp_head), so an -mtp
     build keeps the backbone plan of the plain build.
 
-    always_on_rules=False skips steps 2 to 4 and the separate head plan for
-    callers with their own allocation or exporter constraints.
-
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
     priced into the baseline bpw at their true cost and excluded from every
     boost decision.
     """
-    if always_on_rules:
-        head_shapes = {p: s for p, s in named_shapes.items() if _is_mtp_tensor(p)}
-        if head_shapes:
-            backbone_shapes = {
-                p: s for p, s in named_shapes.items() if p not in head_shapes
-            }
-            plan = _build_quant_plan(
-                backbone_shapes,
-                config,
-                oq_level,
-                target_bpw=target_bpw,
-                hard_cap_bpw=hard_cap_bpw,
-                fixed_overrides=fixed_overrides,
-                supported_bits=supported_bits,
-            )
-            return _plan_mtp_head(
-                plan,
-                backbone_shapes,
-                head_shapes,
-                config,
-                oq_level,
-                fixed_overrides or {},
-                supported_bits,
-            )
+    head_shapes = {p: s for p, s in named_shapes.items() if _is_mtp_tensor(p)}
+    if head_shapes:
+        backbone_shapes = {
+            p: s for p, s in named_shapes.items() if p not in head_shapes
+        }
+        plan = _build_quant_plan(
+            backbone_shapes,
+            config,
+            oq_level,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
+            fixed_overrides=fixed_overrides,
+            supported_bits=supported_bits,
+        )
+        return _plan_mtp_head(
+            plan,
+            backbone_shapes,
+            head_shapes,
+            config,
+            oq_level,
+            fixed_overrides or {},
+            supported_bits,
+        )
 
     base_bits = _base_bits_for_level(oq_level)
     if base_bits not in supported_bits:
@@ -1449,7 +1444,7 @@ def _build_quant_plan(
     # Hybrid dense models: the few full-attention layers carry the long-range
     # context that the sliding or linear layers cannot. One bit above the base
     # keeps q/k/v at one width for the fused projection kernels.
-    if always_on_rules and not is_moe and base_bits >= 3:
+    if not is_moe and base_bits >= 3:
         global_layers = _global_attention_layers(config)
         for path, shape in named_shapes.items():
             if path in boost_map or path in fixed_overrides:
@@ -1519,7 +1514,7 @@ def _build_quant_plan(
     # Dense models: affine 2-bit loses too much on tensors every token runs
     # through, so lift them to 3-bit with wider groups before any boost.
     # Most sensitive layers go first in case the cap stops the pass early.
-    if always_on_rules and not is_moe and base_bits < 3:
+    if not is_moe and base_bits < 3:
         for path, shape in _always_on_candidates(
             named_shapes, config, oq_level, fixed_overrides, layer_scores
         ):
@@ -1588,7 +1583,7 @@ def _build_quant_plan(
     # while each routed expert sees a small share of them. After the
     # protection floor, raise them one step per round, most sensitive first:
     # spreading the budget beats a few 8-bit tensors next to low-bit ones.
-    if always_on_rules and expert_params > 0:
+    if expert_params > 0:
         always_on = _always_on_candidates(
             named_shapes, config, oq_level, fixed_overrides, layer_scores
         )
@@ -1643,15 +1638,8 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            # Only always_on_rules=False plans the MTP head with the backbone.
-            # Its tensors carry no ``layers.<n>`` index but compete like any
-            # other non-expert tensor; score 0 seeds them at the bottom tier
-            # and the under-target fallback lifts them with the rest.
-            if not _is_mtp_tensor(path):
-                continue
-            layer_score = 0.0
-        else:
-            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            continue
+        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = (

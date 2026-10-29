@@ -53,6 +53,7 @@ from mlx_lm.tokenizer_utils import _byte_decoder
 from mlx_vlm.models import cache as _vlm_cache
 
 from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
+from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -151,9 +152,8 @@ def _compact_boundary_snapshot_value(
             compact_deepseek_v41_snapshot(value[1], token_count, block_size)
             delta_arrays = []
             for layer in value[1]:
-                if (
-                    layer.get("class_name") == "DeepseekV41Cache"
-                    and len(layer.get("state", ())) == 8
+                if layer.get("class_name") == "DeepseekV41Cache" and (
+                    is_deepseek_v41_delta(layer.get("state", ()))
                 ):
                     delta_arrays.extend(layer["state"][i] for i in (2, 3))
                 for sub_idx in layer.get("pooling_delta_ranges", {}):
@@ -1835,6 +1835,14 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Priority-based
+
+
+def _takes_next_prefill_tokens(prefill_model: Any) -> bool:
+    """Whether a cache-only prefill hook accepts the next chunk's size."""
+    try:
+        return "next_prefill_tokens" in inspect.signature(prefill_model).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_enabled: bool, block_size: int) -> int:
@@ -4565,6 +4573,21 @@ class Scheduler:
                     )
                     prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
+                if _takes_next_prefill_tokens(prefill_model):
+                    # A cache-only model may skip work the next chunk replaces.
+                    rest = remaining - n_to_process
+                    after = processed_tokens + n_to_process
+                    model_kwargs["next_prefill_tokens"] = (
+                        _expected_chunk_len(
+                            self._prefill_step_size_for_progress(after, rest),
+                            rest,
+                            base_size + after,
+                            boundary_enabled,
+                            block_size,
+                        )
+                        if rest > 0
+                        else 0
+                    )
                 chunk_start = base_size + processed_tokens
                 capture_from = self._dflash_prefill_capture(
                     request,
@@ -6951,6 +6974,12 @@ class Scheduler:
         chunk_kwargs = {}
         if self._supports_skip_lm_head():
             chunk_kwargs["skip_lm_head"] = True
+        if _takes_next_prefill_tokens(prefill_model):
+            chunk_kwargs["next_prefill_tokens"] = (
+                Scheduler._next_prefill_chunk_len(self, state, n)
+                if state.tokens_remaining.shape[1] > 0
+                else 0
+            )
         # Prompt position of the chunk. Only boundary prefill corrects
         # base_size to cached_tokens.
         chunk_start = state.tokens_processed + (
