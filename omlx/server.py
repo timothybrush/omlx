@@ -5938,11 +5938,13 @@ def _compile_grammar_for_request(
     unhonored strict request when ``strict: true`` was set) rather than being
     silent (#1241).
     """
-    compiler = getattr(engine, "grammar_compiler", None)
-
     fmt = _build_format_element(structured_outputs, response_format)
     if fmt is None:
+        # ``grammar_compiler`` builds an xgrammar TokenizerInfo over the
+        # full vocab on first access, so plain text must not touch it.
         return None
+
+    compiler = getattr(engine, "grammar_compiler", None)
 
     if compiler is None:
         if structured_outputs is not None:
@@ -8596,6 +8598,11 @@ async def create_response(
             consolidate_system_messages=False,
             preserve_images=preserve_tool_images,
         )
+        if engine.model_type == "gpt_oss":
+            # Same history shape as extract_harmony_messages. The Harmony template
+            # can reject reasoning_content, which transformers renders as thinking.
+            for msg in messages:
+                msg.pop("reasoning_content", None)
 
         # Convert tools: flat → nested. namespace_aliases maps each expanded
         # namespace member's wire name back for the return path.
