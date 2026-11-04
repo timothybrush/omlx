@@ -608,6 +608,29 @@ class UpdateTemplateRequest(BaseModel):
         return _normalize_profile_settings(value, universal=True)
 
 
+_THEME_TOKEN = re.compile(r"[a-z][a-z0-9-]{0,47}")
+_THEME_HEX = re.compile(r"#[0-9a-f]{6}")
+
+
+class CustomThemeRequest(BaseModel):
+    """Saved color token overrides for the light and dark web UI themes."""
+
+    # omlx_web owns the token list and the contrast floor; check only the shape.
+    light: dict[str, str] = Field(default_factory=dict, max_length=64)
+    dark: dict[str, str] = Field(default_factory=dict, max_length=64)
+
+    @field_validator("light", "dark")
+    @classmethod
+    def _opaque_hex(cls, colors: dict[str, str]) -> dict[str, str]:
+        clean = {}
+        for token, value in colors.items():
+            color = value.strip().lower()
+            if not _THEME_TOKEN.fullmatch(token) or not _THEME_HEX.fullmatch(color):
+                raise ValueError(f"{token!r}: expected a token name and #rrggbb")
+            clean[token] = color
+        return clean
+
+
 # Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
 DASHBOARD_COLUMNS = 24
 DASHBOARD_BLOCK_MIN_W = 6
@@ -812,6 +835,8 @@ class GlobalSettingsRequest(BaseModel):
     ui_language: str | None = None
     # Explicit null restores the default dashboard layout.
     ui_dashboard_layout: DashboardLayoutRequest | None = None
+    # Explicit null restores the stock colors.
+    ui_custom_theme: CustomThemeRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -1735,6 +1760,17 @@ def configured_ui_language() -> str:
     except Exception:
         pass
     return "en"
+
+
+def configured_custom_theme() -> dict[str, dict[str, str]] | None:
+    """Return the saved web UI color overrides, or None for the stock colors."""
+    try:
+        settings = _get_global_settings() if _get_global_settings else None
+        if settings:
+            return settings.ui.custom_theme
+    except Exception:
+        pass
+    return None
 
 
 def format_size(size_bytes: int) -> str:
@@ -4824,6 +4860,7 @@ def _global_settings_response(global_settings):
         "ui": {
             "language": global_settings.ui.language,
             "dashboard_layout": global_settings.ui.dashboard_layout,
+            "custom_theme": global_settings.ui.custom_theme,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -5882,6 +5919,14 @@ async def update_global_settings(
         )
         runtime_applied.append("ui_dashboard_layout")
 
+    if "ui_custom_theme" in request.model_fields_set:
+        theme = request.ui_custom_theme
+        global_settings.ui.custom_theme = (
+            theme.model_dump() if theme is not None and (theme.light or theme.dark)
+            else None
+        )
+        runtime_applied.append("ui_custom_theme")
+
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)
     # from "not sent" (don't touch).
@@ -6314,9 +6359,9 @@ def _get_engine_info() -> dict:
     packages = {
         "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
-        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
+        "mlx-vlm": "https://github.com/Neywa-Labs/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
-        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
+        "mlx-audio": "https://github.com/Neywa-Labs/mlx-audio",
     }
 
     fallback_commits = _load_fallback_commits(packages)

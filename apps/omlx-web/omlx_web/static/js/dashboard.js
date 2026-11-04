@@ -91,7 +91,11 @@
         'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
+    // settings.theme.contrast.<label> for each contrast-rule foreground.
+    const THEME_CONTRAST_LABELS = {
+        'text-primary': 'text', 'text-secondary': 'secondary', 'link-color': 'link', 'btn-primary-text': 'button',
+    };
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -137,6 +141,18 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+            // Script tests load this file without custom_theme.js, hence the fallbacks.
+            customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
+            customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
+            customThemeDefaults: { light: {}, dark: {} },
+            customThemeDraft: { light: {}, dark: {} },
+            customThemeSaving: false,
+            customThemeSaved: false,
+            customThemeError: '',
+            customThemeJson: '',
+            customThemeJsonError: '',
+            _customThemeSavedTimer: null,
+            _customThemeReady: false,
 
             // Global settings section rail
             settingsActiveSection: 'settings-language',
@@ -939,6 +955,7 @@
 
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                if (this.activeTab === 'theme') this.initCustomThemeEditor();
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
                 const source = params.get('source');
@@ -1034,6 +1051,7 @@
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
+                if (tab === 'theme') this.initCustomThemeEditor();
                 this.syncTabStateToUrl();
             },
 
@@ -1382,7 +1400,7 @@
             },
 
             async saveGlobalSettings() {
-                if (this.resettingGlobalSettings) return;
+                if (this.saving || this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -3709,6 +3727,7 @@
             },
 
             async saveModelSettings() {
+                if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
 
                 const a8PrefillValidationError = this.validateA8PrefillSettings();
@@ -4199,6 +4218,17 @@
             },
 
             get claudeCodeCommand() {
+                return this._claudeCodeCommand(this.stats.api_key);
+            },
+
+            // On-screen variant with the auth token masked (sub-key style), so
+            // the rendered dashboard never exposes the API key; the copy
+            // button still copies the real claudeCodeCommand.
+            get claudeCodeCommandDisplay() {
+                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+            },
+
+            _claudeCodeCommand(authToken) {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
@@ -4210,8 +4240,8 @@
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
-                if (this.stats.api_key) {
-                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
+                if (authToken) {
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', authToken));
                 }
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
@@ -5116,11 +5146,12 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return 'rgb(var(--palette-red-500))';
-                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
-                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
-                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
-                return 'rgb(var(--palette-green-500))';
+                if (pct >= 90) return 'var(--danger)';
+                // custom_theme.js sets --meter-high/--meter-mid only for custom status roles.
+                if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
+                if (pct >= 70) return 'var(--warning)';
+                if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
+                return 'var(--success)';
             },
 
             get activeModelsPressureBarStyle() {
@@ -7360,6 +7391,217 @@
                 } else {
                     document.documentElement.removeAttribute('data-enhanced-readability');
                 }
+            },
+
+            // =================================================================
+            // Custom theme
+            // =================================================================
+            initCustomThemeEditor() {
+                if (this._customThemeReady) return;
+                this._customThemeReady = true;
+                this.customThemeDefaults = window.OmlxCustomTheme.defaults();
+                this.fillCustomThemeDraft();
+            },
+
+            fillCustomThemeDraft(theme = this.customThemeStored) {
+                const draft = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        draft[mode][token] = theme[mode]?.[token]
+                            || this.customThemeDefaults[mode][token] || '';
+                    }
+                }
+                this.customThemeDraft = draft;
+            },
+
+            get customThemeActive() {
+                return ['light', 'dark'].some(mode => Object.keys(this.customThemeStored[mode]).length > 0);
+            },
+
+            themeTokenValid(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
+            },
+
+            themeTokenColor(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
+                    || this.customThemeDefaults[mode][token] || '#000000';
+            },
+
+            themeTokenChanged(mode, token) {
+                return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
+            },
+
+            customThemeOverrides() {
+                const overrides = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        const color = this.themeTokenColor(mode, token);
+                        if (color !== this.customThemeDefaults[mode][token]) overrides[mode][token] = color;
+                    }
+                }
+                return overrides;
+            },
+
+            get customThemeDirty() {
+                return JSON.stringify(this.customThemeOverrides()) !== JSON.stringify(this.customThemeStored);
+            },
+
+            get customThemeInputsValid() {
+                return ['light', 'dark'].every(mode =>
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token))
+                    && this.themeContrastChecks(mode).every(check => check.ok));
+            },
+
+            // Column chrome uses stock colors so editing a surface never flips a column.
+            themeModeColor(mode, token) {
+                const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
+                return stock || this.themeTokenColor(mode, token);
+            },
+
+            themeModeHeadStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
+            },
+
+            themeModeCellStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
+            },
+
+            // Edited tokens also carry their derived channels and status tints.
+            themePreviewStyle(mode) {
+                const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
+                const lines = api.DERIVED.map(token => `--${token}: ${stock[token]};`);
+                for (const token of api.TOKENS) {
+                    const color = this.themeTokenColor(mode, token);
+                    lines.push(...(color === stock[token]
+                        ? [`--${token}: ${color};`]
+                        : api.declarations(mode, token, color)));
+                }
+                return lines.join(' ');
+            },
+
+            // The only contrast check: the server stores any #rrggbb it gets.
+            themeContrastChecks(mode) {
+                const api = window.OmlxCustomTheme;
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const lowest = {};
+                for (const { foreground, ratio } of api.contrastChecks(colors)) {
+                    lowest[foreground] = Math.min(lowest[foreground] ?? Infinity, ratio);
+                }
+                return Object.entries(lowest).map(([foreground, ratio]) => ({
+                    id: THEME_CONTRAST_LABELS[foreground],
+                    ratio,
+                    ok: ratio >= api.CONTRAST_FLOOR,
+                }));
+            },
+
+            normalizeThemeInput(mode, token) {
+                const text = String(this.customThemeDraft[mode][token] ?? '').trim();
+                if (!text) {
+                    this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+                    return;
+                }
+                const hex = window.OmlxCustomTheme.normalizeHex(text);
+                if (hex) this.customThemeDraft[mode][token] = hex;
+            },
+
+            resetThemeToken(mode, token) {
+                this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+            },
+
+            focusThemeToken(mode, event) {
+                const token = event.target.closest('[data-token]')?.dataset.token;
+                const field = token && document.getElementById(`theme-token-${mode}-${token}`);
+                if (!field) return;
+                field.focus();
+                field.select();
+            },
+
+            async saveCustomTheme(overrides) {
+                const api = window.OmlxCustomTheme;
+                const theme = api.sanitize(overrides);
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                this.customThemeSaved = false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_custom_theme: api.isEmpty(theme) ? null : theme }),
+                    });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    const clean = api.apply(theme);
+                    this.customThemeStored = clean;
+                    window._customTheme = api.isEmpty(clean) ? null : clean;
+                    this.fillCustomThemeDraft();
+                    return true;
+                } catch (error) {
+                    this.customThemeError = window.t('settings.theme.save_failed');
+                    console.error('Failed to save custom theme:', error);
+                    return false;
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async applyCustomTheme() {
+                if (!this.customThemeInputsValid) return;
+                if (!(await this.saveCustomTheme(this.customThemeOverrides()))) return;
+                this.customThemeSaved = true;
+                clearTimeout(this._customThemeSavedTimer);
+                this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+            },
+
+            discardCustomThemeDraft() {
+                this.customThemeError = '';
+                this.fillCustomThemeDraft();
+            },
+
+            // The full palette, so an agent sees every token, not only the overrides.
+            async copyCustomThemeJson() {
+                const theme = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        theme[mode][token] = this.themeTokenColor(mode, token);
+                    }
+                }
+                this.customThemeJson = JSON.stringify(theme, null, 2);
+                this.customThemeJsonError = '';
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                } catch (error) {
+                    console.debug('Clipboard unavailable:', error);
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            importCustomThemeJson() {
+                const api = window.OmlxCustomTheme;
+                let clean;
+                try {
+                    clean = api.sanitize(JSON.parse(this.customThemeJson));
+                } catch (error) {
+                    clean = { light: {}, dark: {} };
+                }
+                if (api.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.customThemeJsonError = '';
+                this.fillCustomThemeDraft(clean);
+            },
+
+            async resetCustomTheme() {
+                if (!window.confirm(window.t('settings.theme.restore_confirm'))) return;
+                await this.saveCustomTheme(null);
+            },
+
+            openCustomThemeSettings() {
+                this.setSettingsTab('theme');
+                window.scrollTo({ top: 0 });
             },
 
             applyTheme() {
