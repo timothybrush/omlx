@@ -86,7 +86,7 @@ from .prefill_boundaries import (
 )
 from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
-from .prefill_helper.session import HelperPrefill, PrefillHelperSession
+from .prefill_helper.session import MIN_TOKENS, HelperPrefill, PrefillHelperSession
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import (
@@ -2344,6 +2344,7 @@ class Scheduler:
         self._prefill_states: dict[str, _PrefillState] = {}
         # Prefill Accelerator session for this model (see attach_prefill_helper).
         self._prefill_helper = None
+        self._prefill_helper_retry: Callable[[], None] | None = None
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
         self._packed_prefill_disabled: str | None = None
@@ -3384,11 +3385,9 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
-            is_qwen35 = (
-                model_type.startswith("qwen3_5")
-                or model_type == "prism_hadamard_qwen35"
-            )
+            # Wider chunks feed the Qwen3.5 MoE expert GEMMs more rows. Dense
+            # Qwen3.5 gains under 2% and keeps the default chunk and block.
+            is_qwen35_moe = model_type.startswith("qwen3_5_moe")
             is_qwen4 = model_type.startswith("qwen4_exp")
             if is_qwen4:
                 from .custom_kernels.attention import fast
@@ -3403,7 +3402,7 @@ class Scheduler:
                 # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
                 # 8192 fills the gather_qmm tiles better.
                 return 8192
-            if is_qwen35 or is_qwen4:
+            if is_qwen35_moe or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
@@ -6901,6 +6900,13 @@ class Scheduler:
         it. A block drafter's layers come back from whichever Mac runs them.
         """
         session = self._prefill_helper
+        if (
+            session is None
+            and self._prefill_helper_retry is not None
+            and len(tokens) - 1 >= MIN_TOKENS
+        ):
+            # A helper back after a sleep can wait minutes in backoff.
+            self._prefill_helper_retry()
         drafter = _block_drafter_for(self.model)
         if (
             session is None
@@ -15880,13 +15886,16 @@ class Scheduler:
                 and prefill_gate_open
             ):
                 if not self._decode_contention():
-                    # Nothing decodes. Requests that fit in one contended
-                    # chunk prefill ahead of the in-flight chunk, which then
-                    # shrinks while they decode; after it they would wait a
-                    # whole chunk (#5148). Longer ones keep their turn.
-                    limit = Scheduler._contended_chunk_size(self)
+                    # Nothing decodes. Requests that fit in one prefill chunk
+                    # go ahead of the in-flight chunk, which then shrinks
+                    # while they decode; behind it they would wait for whole
+                    # chunks (#5148). Longer ones keep their turn.
                     if all(
-                        request.num_prompt_tokens <= limit for request in self.waiting
+                        request.num_prompt_tokens
+                        <= Scheduler._base_prefill_step_size(
+                            self, 0, request.num_prompt_tokens
+                        )
+                        for request in self.waiting
                     ):
                         admit_first = True
                         prefilling_before = {
