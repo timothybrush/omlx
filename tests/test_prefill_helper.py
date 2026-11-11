@@ -766,8 +766,11 @@ class _FakeLauncher:
         self.budget, self.missing = budget, list(missing)
         self.free, self.copies, self.hold = free, list(copies), hold
         self.copied, self.deleted, self.servers, self.paired = [], [], [], True
+        self.unreachable = False
 
     def resolve_target(self, node_id):
+        if self.unreachable:
+            raise launcher.UnreachableError("M5max does not answer over SSH.")
         if not self.paired:
             raise launcher.LaunchError("This Mac is not paired.")
         return HelperTarget(
@@ -1026,6 +1029,20 @@ def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
     manager.configure("node-2", None)
     _wait_state(manager, "error", reason="not paired")
     assert attached == []
+    manager.close()
+
+
+def test_manager_retries_a_helper_that_does_not_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    fake = _FakeLauncher(None)
+    fake.unreachable = True
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    _wait_state(manager, "offline", reason="does not answer over SSH")
+    fake.unreachable = False
+    _wait_state(manager, "ready")
+    assert attached
     manager.close()
 
 
@@ -2049,8 +2066,19 @@ def test_payload_matches_the_contract_fixture(family):
             np.testing.assert_array_equal(data, expected[name], err_msg=hint)
 
 
-def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path):
-    # Last in this file: load_first installs the server's prefill patches.
+def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path, monkeypatch):
+    # The server's prefill patches are process-wide; xdist runs other files next.
+    for name in (
+        "apply_sdpa256_attention_patch",
+        "apply_qwen35_fa256_attention_patch",
+        "apply_qwen35_gdn_prework_patch",
+        "apply_qwen35_gdn_prefill_patch",
+        "apply_qwen35_q4_mlp_patch",
+        "apply_qwen35_q4_prefill_linear_patch",
+    ):
+        monkeypatch.setattr(
+            f"omlx.prefill_helper.adapters.qwen3_5.{name}", lambda *_: None
+        )
     source = _CONTRACT_DIR / "qwen3_5" / "model"
     weights = mx.load(str(source / "model.safetensors"))
     config = json.loads((source / "config.json").read_text())
