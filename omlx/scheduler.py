@@ -1792,6 +1792,9 @@ def _get_attr_or_key(obj: Any, name: str) -> Any:
 # time stays at parity with fairness off; 1.0 buys ~5x decode at ~16%
 # batch-completion cost.
 _DECODE_FAIR_SHARE = 0.5
+# Per-row decode rate that the adaptive share leaves to running requests.
+# Decode time beyond it only delays queued prompts, so the debt stops there.
+_DECODE_RATE_FLOOR_TPS = 10.0
 # Contended chunks are sized in TIME, not tokens: a chunk is the victim's
 # decode stall, and stall tolerance is a human constant while tokens/second
 # is a machine constant. The cap in tokens is derived per engine from the
@@ -1814,6 +1817,20 @@ _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 # Most requests whose resumable prefill chunks share one forward.
 _PACKED_PREFILL_MAX_ROWS = 4
+
+
+def _decode_share_for_floor(row_decode_tps: float | None) -> float:
+    """Debt ratio that holds each running row at the rate floor.
+
+    A row at ``row_decode_tps`` needs ``floor / row_decode_tps`` of wall time.
+    It never exceeds the fixed share, which also applies before any measurement.
+    """
+    if not row_decode_tps or row_decode_tps <= 0.0:
+        return _DECODE_FAIR_SHARE
+    fraction = _DECODE_RATE_FLOOR_TPS / row_decode_tps
+    if fraction >= 1.0:
+        return _DECODE_FAIR_SHARE
+    return min(_DECODE_FAIR_SHARE, fraction / (1.0 - fraction))
 
 
 def _ceil_to_contended_grid(tokens: int) -> int:
@@ -1949,6 +1966,8 @@ class SchedulerConfig:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk. Inert while nothing is decoding.
     decode_fairness: bool = True
+    # When True, own-engine debt shrinks while running rows stay above the floor.
+    adaptive_decode_share: bool = True
     # Set by the engine when MoE expert offload wrapped the model.
     moe_offload_active: bool = False
 
@@ -2011,6 +2030,9 @@ class SchedulerOutput:
     prefill_eviction_request: PrefillEvictionRequest | None = None
     # Whether any work was done
     has_work: bool = False
+    # Whether this step ran a chunked-prefill forward. EngineCore ends a
+    # decode burst after a slow one so queued admissions run first.
+    ran_prefill_chunk: bool = False
 
 
 class _ResumedStopSequences:
@@ -2431,9 +2453,16 @@ class Scheduler:
         self._decode_fairness: bool = bool(
             getattr(self.config, "decode_fairness", True)
         )
+        self._adaptive_decode_share: bool = bool(
+            getattr(self.config, "adaptive_decode_share", True)
+        )
         self._decode_time_owed_s: float = 0.0
+        self._row_decode_tps: float | None = None
+        self._row_decode_acc: list[float] = [0.0, 0.0]
         self._prefill_hold_until: float = 0.0
         self._admit_prefill_next: bool = False
+        # Chunked-prefill forwards run so far; step() reports whether it ran one.
+        self._prefill_forwards: int = 0
         # Measured throughputs feeding the adaptive fairness constants.
         # Best-observed prefill tok/s sizes the contended chunk (stall-time
         # target): contended chunks only measure SLOWER, so a running max
@@ -3823,6 +3852,9 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+        # The wired limit is process-wide. Restoring this generator's snapshot
+        # on close would unwire models that other generators still serve.
+        bg._old_wired_limit = None
 
         return bg
 
@@ -6527,6 +6559,10 @@ class Scheduler:
             return 0
         if not self._decode_contention():
             return 0
+        return Scheduler._contended_chunk_size(self)
+
+    def _contended_chunk_size(self) -> int:
+        """Chunk size used while a decode contends with this prefill."""
         tps = self._prefill_tps_best
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
@@ -6561,6 +6597,7 @@ class Scheduler:
           long each hold has to be, and the deadline is shared process-wide
           so concurrent prefillers pause together.
         The debt resets whenever no decode is running anywhere.
+        The measured row rate resets with it, since the next rows may differ.
         """
         if not self._decode_fairness:
             return True
@@ -6568,18 +6605,24 @@ class Scheduler:
             return False
         if not self.running:
             self._decode_time_owed_s = 0.0
+            self._row_decode_tps = None
         return time.perf_counter() >= self._prefill_hold_deadline()
 
     def _accrue_decode_debt(self, chunk_seconds: float) -> None:
         if not self._decode_fairness:
             return
-        share = max(0.0, chunk_seconds) * _DECODE_FAIR_SHARE
-        if share <= 0.0:
+        chunk_seconds = max(0.0, chunk_seconds)
+        if chunk_seconds <= 0.0:
             return
+        # Another engine's decode rate is not visible here, so it gets the fixed share.
+        others_decoding = self._others_decoding()
         if self.running:
-            self._decode_time_owed_s += share
-        elif self._others_decoding():
-            deadline = time.perf_counter() + share
+            ratio = _DECODE_FAIR_SHARE
+            if self._adaptive_decode_share and not others_decoding:
+                ratio = _decode_share_for_floor(self._row_decode_tps)
+            self._decode_time_owed_s += chunk_seconds * ratio
+        elif others_decoding:
+            deadline = time.perf_counter() + chunk_seconds * _DECODE_FAIR_SHARE
             self._prefill_hold_until = deadline
             with suppress(Exception):
                 get_decode_activity().extend_hold(deadline)
@@ -6591,13 +6634,32 @@ class Scheduler:
             0.0, self._decode_time_owed_s - max(0.0, decode_seconds)
         )
 
+    def _sample_row_decode_rate(self, tokens: int, decode_dt: float) -> None:
+        """Track tokens per running row per second of decode time.
+
+        Uses 100 ms buckets like ``_sample_decode_rate``; one MTP pop is not a rate.
+        """
+        rows = len(self.running)
+        if tokens <= 0 or decode_dt <= 0.0 or rows <= 0:
+            return
+        acc = self._row_decode_acc
+        acc[0] += tokens / rows
+        acc[1] += decode_dt
+        if acc[1] < 0.1:
+            return
+        rate = acc[0] / acc[1]
+        acc[0] = 0.0
+        acc[1] = 0.0
+        prev = self._row_decode_tps
+        self._row_decode_tps = rate if prev is None else 0.5 * prev + 0.5 * rate
+
     def _sample_decode_rate(self, tokens: int, decode_dt: float) -> None:
         """Track solo vs contended decode rate (observability only).
 
         Quiet samples (no prefill active anywhere in the process) feed the
-        solo baseline; the rest feed the contended EMA. The pair verifies
-        the fairness share guarantee — contended should hover around
-        share/(1+share) of solo — without steering anything.
+        solo baseline; the rest feed the contended EMA. Neither steers anything.
+        With the fixed share, contended should hover around share/(1+share) of solo.
+        The adaptive share can sit lower, down to the decode rate floor.
 
         Per-step rates are useless here: an MTP queue pop emits a token in
         microseconds, so single steps read as tens of thousands of tok/s.
@@ -7220,6 +7282,7 @@ class Scheduler:
         Returns, per plan, whether that request's prefill is complete.
         """
         interrupt_batch_timing(getattr(self, "batch_generator", None))
+        self._prefill_forwards = getattr(self, "_prefill_forwards", 0) + 1
         head = plans[0]
         processed_before = [plan.state.tokens_processed for plan in plans]
         kv_len = max(
@@ -7935,6 +7998,7 @@ class Scheduler:
         self,
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
+        first: "set[str] | frozenset[str]" = frozenset(),
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
@@ -7949,6 +8013,8 @@ class Scheduler:
             rejected: Per-step rejected outputs. A chunked prefill that hits
                 the memory hard limit emits a finish_reason="error" entry
                 here so the engine can surface the failure to the client.
+            first: Short requests admitted ahead of the in-flight chunk. They
+                run first so a full-width head chunk does not delay them.
         """
         if not self.prefilling:
             return
@@ -7969,6 +8035,8 @@ class Scheduler:
             # These chunks finish their requests; behind a longer head they
             # would wait for its whole prefill, so they run first.
             pending_prefills.sort(key=lambda request: not too_short_to_pack(request))
+        if first:
+            pending_prefills.sort(key=lambda request: request.request_id not in first)
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -13740,6 +13808,13 @@ class Scheduler:
             # restored KV. Commit metrics only after both guards have run.
             self._record_prefix_cache_result(request)
 
+            if request.specprefill_indices is None and len(tokens_to_process) == 1:
+                # External prefill restores the drafter context of cached
+                # tokens, and a hit that leaves one prompt token skips it.
+                Scheduler._dflash_prepare_request(
+                    self, request, len(request.prompt_token_ids) - 1
+                )
+
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
@@ -15762,6 +15837,7 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+        prefill_forwards = getattr(self, "_prefill_forwards", 0)
 
         # Publish decode activity for cross-engine prefill fairness (a
         # count of 0 removes the entry, so idle engines never throttle a
@@ -15795,23 +15871,45 @@ class Scheduler:
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
             admit_first = False
+            prefilling_before: set[str] | None = None
             prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
             if (
                 self._decode_fairness
                 and self.prefilling
                 and self.waiting
-                and self._decode_contention()
                 and prefill_gate_open
             ):
-                admit_first = self._admit_prefill_next
-                self._admit_prefill_next = not admit_first
+                if not self._decode_contention():
+                    # Nothing decodes. Requests that fit in one contended
+                    # chunk prefill ahead of the in-flight chunk, which then
+                    # shrinks while they decode; after it they would wait a
+                    # whole chunk (#5148). Longer ones keep their turn.
+                    limit = Scheduler._contended_chunk_size(self)
+                    if all(
+                        request.num_prompt_tokens <= limit for request in self.waiting
+                    ):
+                        admit_first = True
+                        prefilling_before = {
+                            request.request_id for request in self.prefilling
+                        }
+                else:
+                    admit_first = self._admit_prefill_next
+                    self._admit_prefill_next = not admit_first
             if admit_first:
                 scheduled, rejected = self._schedule_waiting()
+            # Short requests admitted above that wait to pack go ahead of the head.
+            short_first = (
+                {r.request_id for r in self.prefilling} - prefilling_before
+                if prefilling_before is not None
+                else set()
+            )
 
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
             if self.prefilling and prefill_gate_open:
-                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
+                self._advance_chunked_prefills(
+                    chunked_scheduled, chunked_rejected, first=short_first
+                )
 
             if not admit_first:
                 scheduled, rejected = self._schedule_waiting()
@@ -15864,6 +15962,7 @@ class Scheduler:
                     responses.extend(self._step_vlm_mtp())
                 _decode_dt = time.perf_counter() - _t_decode_start
                 self._repay_decode_debt(_decode_dt)
+                self._sample_row_decode_rate(len(responses), _decode_dt)
                 self._sample_decode_rate(len(responses), _decode_dt)
                 output.has_work = True
 
@@ -16050,6 +16149,9 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        output.ran_prefill_chunk = (
+            getattr(self, "_prefill_forwards", 0) != prefill_forwards
+        )
         return output
 
     def _publish_admin_snapshot(self) -> None:
