@@ -48,6 +48,10 @@ def _replay(bounds, layers):
     meta, arrays = _case()
     sizes, skip = meta["sizes"], meta["prefix_chunks"]
     stages = [_stage(a, b) for a, b in zip(bounds, bounds[1:])]
+    for stage in stages:
+        # A layer loaded again after a long prompt runs as at the first load.
+        stage.drop_layer()
+        stage.add_layer()
     jobs = []
     for stage in stages:
         own = max(0, min(layers, stage.last) - stage.first)
@@ -170,5 +174,27 @@ def test_expert_tiles_read_banks_as_gather_qmm(spec):
     )
     assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR
     got = kernels.expert_down(want.reshape(40, -1), experts, down)
-    want = down(want, experts)
+    want_down = down(want, experts)
+    assert (
+        kernels.relative_error(got, want_down.reshape(got.shape)) < layers._TILE_ERROR
+    )
+    if not kernels.mx_experts_fit([gate, up, down]):
+        return
+
+    # The block-scaled tiles: the round trip as codes, the SwiGLU output too.
+    def values(codes, scales):
+        scale = mx.repeat(mx.power(2.0, scales.astype(mx.float32) - 127), 32, -1)
+        return quant.from_fp8(codes) * scale
+
+    raw = mx.random.normal((40, 256), key=keys[0]).astype(mx.bfloat16)
+    codes, scales = kernels.fp8_codes(raw)
+    assert mx.array_equal(values(codes, scales).astype(mx.bfloat16), x).item()
+    codes, scales = kernels.expert_gate_up_mx(
+        codes, scales, mx.arange(40, dtype=mx.uint32), experts, gate, up, weights, 10.0
+    )
+    got = values(codes, scales)
     assert kernels.relative_error(got, want.reshape(got.shape)) < layers._TILE_ERROR
+    got = kernels.expert_down_mx(codes, scales, experts, down)
+    assert (
+        kernels.relative_error(got, want_down.reshape(got.shape)) < layers._TILE_ERROR
+    )
