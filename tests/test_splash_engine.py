@@ -1328,7 +1328,8 @@ class TestStreaming:
 # that carry the key from SPLASH_API_KEY.
 FAKE_SERVER = textwrap.dedent("""\
     import json, os, sys
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler
+    from socketserver import TCPServer
     args = sys.argv[1:]
     model, port = args[args.index("--model") + 1], int(args[args.index("--port") + 1])
     assert os.environ["HF_HUB_OFFLINE"] == "1"
@@ -1349,7 +1350,8 @@ FAKE_SERVER = textwrap.dedent("""\
             self.wfile.write(json.dumps(data).encode())
         def log_message(self, *a):
             pass
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # HTTPServer resolves the host name, which a broken resolver holds for 35 s.
+    TCPServer(("127.0.0.1", port), Handler).serve_forever()
     """)
 
 
@@ -1994,6 +1996,8 @@ class TestNativeResponseFormat:
             engine.start = AsyncMock()
             engine.count_chat_tokens.return_value = 10
             pool = MagicMock()
+            # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+            pool._scheduler_config.paged_ssd_cache_dir = None
             pool.preload_pinned_models = AsyncMock()
             pool.check_ttl_expirations = AsyncMock()
             pool.shutdown = AsyncMock()
@@ -2172,7 +2176,7 @@ class TestProcessMemory:
             "base_url": "http://127.0.0.1:8123/v1",
             "api_key": "secret",
             "model": REPO_ID,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
 
