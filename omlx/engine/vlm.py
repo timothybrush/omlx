@@ -57,6 +57,7 @@ from ..model_settings import (
     ced_prefill_on,
 )
 from ..models.vlm import VLMModelAdapter
+from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import vlm as inkling2_vlm
@@ -2162,12 +2163,14 @@ class VLMBatchedEngine(BaseEngine):
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -2211,6 +2214,9 @@ class VLMBatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2278,10 +2284,12 @@ class VLMBatchedEngine(BaseEngine):
         # class hooks are installed later, outside the other Qwen class patches.
         ane_count = 0
         requested_ane_sequence_length = 2048
-        if (
-            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
-            and ane_prefill_backend(self.model_type) == "qwen"
-        ):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        ane_on = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_on and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+        elif ane_on and ane_prefill_backend(self.model_type) == "qwen":
             ane_fraction = ane_prefill_fraction(
                 self._model_settings.qwen35_ane_prefill_fraction, self.model_type
             )
@@ -2524,6 +2532,7 @@ class VLMBatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -2698,6 +2707,9 @@ class VLMBatchedEngine(BaseEngine):
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
         a8_on = a8_prefill_on(self._model_settings)
+        if a8_on and oqh:
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+            a8_on = False
         if a8_on and self.model_type in MINIMAX_M3_MODEL_TYPES:
             tagged = minimax_a8.tag(
                 self._vlm_model,
