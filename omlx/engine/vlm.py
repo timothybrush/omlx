@@ -61,6 +61,7 @@ from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
@@ -279,6 +280,37 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "disabled"
 
 
+_HY_V4_THINKING_OFF = {"none", "off", "no_think"}
+
+
+def _apply_hy_v4_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Hy4's reasoning_effort (no_think / high).
+
+    The Hy4 template raises on any other effort value, and the generic
+    fallback would then render its default ``high``, so an explicit "off"
+    must become ``no_think`` here.
+    """
+    if model_type not in ("hy_v4_vl", "hy_v4_flash"):
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in _HY_V4_THINKING_OFF
+    if off or (effort is None and enable_thinking is False):
+        template_kwargs["reasoning_effort"] = "no_think"
+
+
+def _apply_template_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Translate oMLX thinking switches into model-specific template kwargs."""
+    _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+    _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
+
+
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
     from mlx_vlm.tokenizer_utils import load_tokenizer
     from mlx_vlm.utils import StoppingCriteria
@@ -298,12 +330,16 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     return tokenizer
 
 
-def _load_cohere2_moe_text_model(
+def _load_text_model_with_tokenizer_fallback(
     model_name: str,
     *,
     trust_remote_code: bool = False,
 ):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    """Load a text-only mlx-vlm family with a tokenizer-only fallback.
+
+    Used when the checkpoint's processor class is missing from the installed
+    transformers (Cohere2 MoE).
+    """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
 
@@ -325,7 +361,7 @@ def _load_cohere2_moe_text_model(
         )
     except Exception as exc:
         logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "mlx-vlm processor load failed for %s; "
             "falling back to AutoTokenizer: %s",
             model_name,
             exc,
@@ -1592,6 +1628,8 @@ def _count_image_tokens_real(
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
     qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
+    # Processors with extra placeholder tokens (Hy4's row newlines) count exactly.
+    token_counter = getattr(ip, "count_image_tokens", None)
     patch_counter = getattr(ip, "get_number_of_image_patches", None)
     glm_ok = (
         callable(patch_counter)
@@ -1617,8 +1655,13 @@ def _count_image_tokens_real(
 
     total = 0
     for wh in dimensions:
-        if wh is None or not (qwen_ok or glm_ok):
+        if wh is None or not (qwen_ok or glm_ok or callable(token_counter)):
             total += upper_bound
+        elif callable(token_counter):
+            try:
+                total += int(token_counter(wh[1], wh[0]))
+            except Exception:
+                total += upper_bound
         elif glm_ok:
             try:
                 total += int(patch_counter(wh[1], wh[0]) // (ms**2))
@@ -2110,7 +2153,7 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
-                if model_type == "inkling2":
+                if model_type in INKLING2_MODEL_TYPES:
                     return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
@@ -2120,7 +2163,7 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
+                    return _load_text_model_with_tokenizer_fallback(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
@@ -4312,7 +4355,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         if prompt_only:
@@ -4440,7 +4483,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
-                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
+                _apply_template_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -4851,7 +4894,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
-            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
+            _apply_template_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
@@ -5868,7 +5911,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         try:
