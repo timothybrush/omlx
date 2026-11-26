@@ -1334,6 +1334,7 @@ def _inkling2_offloaded(tmp_path, dims):
             for proj in (layer.mlp.experts.w13, layer.mlp.experts.w2):
                 if "global_scale" in proj:
                     proj.global_scale = proj.global_scale * mx.linspace(0.5, 2, 32)
+    mx.eval(model.parameters())
     mx.save_safetensors(
         str(tmp_path / "model.safetensors"), dict(tree_flatten(reference.parameters()))
     )
@@ -1352,22 +1353,22 @@ def test_inkling2_offloaded_logits_match_resident(tmp_path, dims):
     outs = []
     for m in (reference, model):
         cache = m.make_cache()
-        logits = [m(ids[:, :16], cache=cache)]
-        for t in range(16, 24):
-            logits.append(m(ids[:, t : t + 1], cache=cache))
+        logits = [m(ids[:, t : t + 1], cache=cache) for t in range(24)]
         outs.append(mx.concatenate(logits, axis=1))
     mx.eval(outs)
-    assert mx.abs(outs[0][..., :300] - outs[1][..., :300]).max().item() < 1e-4
+    assert mx.array_equal(outs[0][..., :300], outs[1][..., :300]).item()
     assert moe_offload_stats(model)["misses"] > 8 * len(model.model.layers)
 
 
 def test_inkling2_offload_over_capacity_reads_only_missing_experts(tmp_path):
-    _, model = _inkling2_offloaded(tmp_path, {})
-    experts = model.model.layers[0].mlp.experts
+    reference, model = _inkling2_offloaded(tmp_path, {})
+    experts = model.model.layers[-1].mlp.experts
     x = mx.random.normal((64, 128)).astype(mx.bfloat16)
     inds = mx.arange(64 * 8).reshape(64, 8) % 32
     w = mx.ones((64, 8))
-    mx.eval(experts.unreduced(x, inds, w))
+    expected = reference.model.layers[-1].mlp.experts(x, inds, w)
+    got = inkling2_model.moe_sum(*experts.unreduced(x, inds, w))
+    assert (mx.abs(got - expected).max() / mx.abs(expected).max()).item() < 1e-2
     before = experts.cache.misses
     mx.eval(experts.unreduced(x, inds, w))
     assert experts.cache.misses - before == 32 - experts.cache.capacity
@@ -1379,14 +1380,15 @@ def test_inkling2_offloaded_row_exact_verify_matches_resident(tmp_path):
     blocks = []
     for m in (reference, model):
         cache = m.make_cache()
-        m(ids[:, :16], cache=cache)
+        for t in range(16):
+            m(ids[:, t : t + 1], cache=cache)
         set_verify_qmm_armed(True, row_exact=True)
         try:
             blocks.append(m(ids[:, 16:], cache=cache))
         finally:
             set_verify_qmm_armed(False)
     mx.eval(blocks)
-    assert mx.abs(blocks[0][..., :300] - blocks[1][..., :300]).max().item() < 1e-4
+    assert mx.array_equal(blocks[0][..., :300], blocks[1][..., :300]).item()
 
 
 @pytest.mark.parametrize(
@@ -1504,8 +1506,6 @@ def test_nax_banded_attention_rows_do_not_depend_on_the_block():
 
 
 def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
-    """Full-attention blocks of more than 8 queries, lone or left-padded,
-    build no mask on NAX hosts; shorter blocks and sliding layers keep SDPA."""
     from omlx.patches.inkling2 import kernels
 
     nax_attention = _nax_banded_or_skip()
@@ -1525,7 +1525,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         (2, 70, lp, 0, True),
         (1, 9, None, 0, True),
         (1, 8, None, 0, False),
-        (1, 70, None, 32, False),
+        (1, 70, None, 32, True),
     ):
         args = _decode_attention_case(batch, 6, 2, length, 300, 32, mx.bfloat16, 128)
         calls.clear()
@@ -1534,7 +1534,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         )
         assert any(calls) == taken
         if taken:
-            ref = kernels._masked_attention(*args, scale, 0, padding)
+            ref = kernels._masked_attention(*args, scale, window, padding)
             diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()
             assert diff.item() < 1e-2
 
